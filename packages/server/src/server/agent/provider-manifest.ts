@@ -183,6 +183,15 @@ export const AGENT_PROVIDER_DEFINITIONS: AgentProviderDefinition[] = [
     defaultModeId: null,
     modes: [],
   },
+  /* [cursor-sdk-provider] BEGIN — re-apply after upstream rebase */
+  {
+    id: "cursor",
+    label: "Cursor",
+    description: "Cursor Agent via official @cursor/sdk — local runtime with full session control",
+    defaultModeId: null,
+    modes: [],
+  },
+  /* [cursor-sdk-provider] END */
 ];
 
 export const DEV_AGENT_PROVIDER_DEFINITIONS: AgentProviderDefinition[] = [

@@ -28,6 +28,9 @@ import { GenericACPAgentClient } from "./providers/generic-acp-agent.js";
 import { OpenCodeAgentClient, OpenCodeServerManager } from "./providers/opencode-agent.js";
 import { PiDirectAgentClient } from "./providers/pi-direct-agent.js";
 import { MockLoadTestAgentClient } from "./providers/mock-load-test-agent.js";
+/* [cursor-sdk-provider] BEGIN — re-apply after upstream rebase */
+import { CursorSdkAgentClient } from "./providers/cursor-sdk-agent.js";
+/* [cursor-sdk-provider] END */
 import {
   AGENT_PROVIDER_DEFINITIONS,
   BUILTIN_PROVIDER_IDS,
@@ -90,6 +93,13 @@ const PROVIDER_CLIENT_FACTORIES: Record<string, ProviderClientFactory> = {
       logger,
       runtimeSettings,
     }),
+  /* [cursor-sdk-provider] BEGIN — re-apply after upstream rebase */
+  cursor: (logger, runtimeSettings) =>
+    new CursorSdkAgentClient({
+      logger,
+      runtimeSettings,
+    }),
+  /* [cursor-sdk-provider] END */
   mock: (logger) => new MockLoadTestAgentClient(logger),
 };
 
