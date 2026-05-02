@@ -240,6 +240,106 @@ function mapTurnUsage(usage: TurnEndedUpdate["usage"]): AgentUsage | undefined {
   };
 }
 
+/**
+ * Map a structured ToolCall from run.conversation() to a Paseo ToolCallDetail.
+ *
+ * Unlike SDKToolUseMessage (which has unknown args/result), ConversationTurn's
+ * ToolCall is a fully typed discriminated union with known arg and result shapes.
+ * This gives us much richer detail than the stream-time mapping.
+ */
+function mapCursorConversationToolCall(
+  tc: { type: string; args?: unknown; result?: { status: string; value?: unknown; error?: unknown } },
+): ToolCallDetail {
+  const args = tc.args as Record<string, unknown> | undefined;
+  const resultValue = tc.result?.status === "success"
+    ? (tc.result as { value?: unknown }).value as Record<string, unknown> | undefined
+    : undefined;
+
+  switch (tc.type) {
+    case "shell": {
+      const shellArgs = args as { command?: string; workingDirectory?: string } | undefined;
+      const shellResult = resultValue as { stdout?: string; stderr?: string; exitCode?: number; signal?: string } | undefined;
+      return {
+        type: "shell",
+        command: shellArgs?.command ?? "shell",
+        cwd: shellArgs?.workingDirectory,
+        output: shellResult?.stdout,
+        exitCode: shellResult?.exitCode ?? null,
+      };
+    }
+    case "read": {
+      const readArgs = args as { path?: string } | undefined;
+      const readResult = resultValue as { content?: string } | undefined;
+      return {
+        type: "read",
+        filePath: readArgs?.path ?? "",
+        content: readResult?.content,
+      };
+    }
+    case "edit": {
+      const editArgs = args as { path?: string } | undefined;
+      const editResult = resultValue as { diffString?: string; linesAdded?: number; linesRemoved?: number } | undefined;
+      return {
+        type: "edit",
+        filePath: editArgs?.path ?? "",
+        unifiedDiff: editResult?.diffString,
+      };
+    }
+    case "write": {
+      const writeArgs = args as { path?: string; fileText?: string } | undefined;
+      return {
+        type: "write",
+        filePath: writeArgs?.path ?? "",
+        content: writeArgs?.fileText,
+      };
+    }
+    case "grep": {
+      const grepArgs = args as { pattern?: string; path?: string } | undefined;
+      return {
+        type: "search",
+        query: grepArgs?.pattern ?? "grep",
+        toolName: "grep",
+      };
+    }
+    case "glob": {
+      const globArgs = args as { globPattern?: string; targetDirectory?: string } | undefined;
+      return {
+        type: "search",
+        query: globArgs?.globPattern ?? "glob",
+        toolName: "glob",
+      };
+    }
+    case "semSearch": {
+      const semArgs = args as { query?: string } | undefined;
+      return {
+        type: "search",
+        query: semArgs?.query ?? "semSearch",
+      };
+    }
+    case "ls": {
+      const lsArgs = args as { path?: string } | undefined;
+      return {
+        type: "search",
+        query: lsArgs?.path ?? "ls",
+      };
+    }
+    case "mcp": {
+      const mcpArgs = args as { toolName?: string; providerIdentifier?: string; args?: unknown } | undefined;
+      return {
+        type: "plain_text",
+        label: `MCP: ${mcpArgs?.providerIdentifier ?? ""}/${mcpArgs?.toolName ?? ""}`.replace(/^\//, ""),
+        text: JSON.stringify(mcpArgs?.args ?? {}),
+      };
+    }
+    default:
+      return {
+        type: "unknown",
+        input: args ?? null,
+        output: resultValue ?? null,
+      };
+  }
+}
+
 // ---------------------------------------------------------------------------
 // CursorSdkAgentSession
 // ---------------------------------------------------------------------------
@@ -488,9 +588,18 @@ export class CursorSdkAgentSession implements AgentSession {
           this.handleSdkMessage(msg);
         }
 
-        // Use run.wait() to get the authoritative final status and duration.
-        // This is the pattern from the official cookbook.
+        // Use run.wait() to get the authoritative final status, duration, and model.
+        // Per the cookbook: usage is a runtime field not in the type definition,
+        // accessed via (result as { usage?: { inputTokens?: number; outputTokens?: number } }).
         const result = await run.wait();
+        const runUsage = (result as { usage?: { inputTokens?: number; outputTokens?: number } }).usage;
+        if (runUsage?.inputTokens || runUsage?.outputTokens) {
+          // Prefer run.wait() usage over onDelta usage if available
+          this.latestUsage = {
+            inputTokens: runUsage.inputTokens,
+            outputTokens: runUsage.outputTokens,
+          };
+        }
 
         if (this.activeTurnId === turnId) {
           this.activeTurnId = null;
@@ -546,9 +655,15 @@ export class CursorSdkAgentSession implements AgentSession {
    * Replay history using run.conversation() on the most recent run.
    * The SDK returns structured ConversationTurn[] with steps.
    */
+  /**
+   * Replay history using run.conversation() on the most recent run.
+   *
+   * The SDK's ConversationTurn has a fully typed ToolCall discriminated union
+   * (shell / write / read / edit / grep / glob / ls / mcp / semSearch / task / ...).
+   * We map each variant to the appropriate Paseo ToolCallDetail.
+   */
   async *streamHistory(): AsyncGenerator<AgentStreamEvent> {
     try {
-      // List runs for this agent and replay the most recent one
       const { items } = await Agent.listRuns(this.sdkAgent.agentId, {
         runtime: "local",
         cwd: this.config.cwd,
@@ -557,8 +672,7 @@ export class CursorSdkAgentSession implements AgentSession {
 
       if (items.length === 0) return;
 
-      const latestRun = items[0];
-      const turns = await latestRun.conversation();
+      const turns = await items[0].conversation();
 
       for (const turn of turns) {
         if (turn.type === "agentConversationTurn") {
@@ -586,24 +700,24 @@ export class CursorSdkAgentSession implements AgentSession {
                 item: { type: "reasoning", text: step.message.text },
               };
             } else if (step.type === "toolCall") {
-              // ToolCall is an internal discriminated union — treat as unknown
-              const toolCall = step.message as unknown as {
-                name?: string;
-                callId?: string;
-                input?: unknown;
-                output?: unknown;
+              // step.message is a fully typed ToolCall discriminated union.
+              // Map each variant to the appropriate Paseo ToolCallDetail.
+              const tc = step.message;
+              const detail = mapCursorConversationToolCall(tc);
+              const isFailed = tc.result?.status === "error";
+              const baseItem = {
+                type: "tool_call" as const,
+                callId: randomUUID(),
+                name: tc.type,
+                detail,
               };
+              const item = isFailed
+                ? { ...baseItem, status: "failed" as const, error: String((tc.result as { error?: unknown } | undefined)?.error ?? "Tool call failed") }
+                : { ...baseItem, status: "completed" as const, error: null };
               yield {
                 type: "timeline",
                 provider: CURSOR_PROVIDER,
-                item: {
-                  type: "tool_call",
-                  callId: toolCall.callId ?? randomUUID(),
-                  name: toolCall.name ?? "tool",
-                  status: "completed",
-                  detail: { type: "unknown", input: toolCall.input ?? null, output: toolCall.output ?? null },
-                  error: null,
-                },
+                item,
               };
             }
           }
