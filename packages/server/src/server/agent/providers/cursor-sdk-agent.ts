@@ -10,14 +10,18 @@
  *
  * Upstream merge strategy: this file is self-contained and only touches
  * three upstream files (provider-manifest.ts, provider-registry.ts,
- * agent-sdk-types.ts). All changes there are clearly marked with
+ * package.json). All changes there are clearly marked with
  * "// [cursor-sdk-provider]" so they are easy to identify and re-apply
  * after an upstream rebase.
+ *
+ * Reference: https://cursor.com/docs/sdk/typescript
+ * Example:   https://github.com/cursor/cookbook/tree/main/sdk/coding-agent-cli
  */
 
+import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import type { Logger } from "pino";
-import { Agent } from "@cursor/sdk";
+import { Agent, Cursor } from "@cursor/sdk";
 import type {
   SDKAgent,
   SDKMessage,
@@ -26,6 +30,8 @@ import type {
   SDKThinkingMessage,
   SDKStatusMessage,
   SDKTaskMessage,
+  Run,
+  TurnEndedUpdate,
 } from "@cursor/sdk";
 
 import type {
@@ -46,7 +52,10 @@ import type {
   AgentSlashCommand,
   AgentStreamEvent,
   AgentTimelineItem,
+  AgentUsage,
   ListModelsOptions,
+  ListPersistedAgentsOptions,
+  PersistedAgentDescriptor,
   ToolCallDetail,
 } from "../agent-sdk-types.js";
 import type { ProviderRuntimeSettings } from "../provider-launch-config.js";
@@ -84,15 +93,22 @@ function convertPromptToText(prompt: AgentPromptInput): string {
   return prompt
     .map((block) => {
       if (block.type === "text") return block.text;
-      return renderPromptAttachmentAsText(block as Parameters<typeof renderPromptAttachmentAsText>[0]);
+      return renderPromptAttachmentAsText(
+        block as Parameters<typeof renderPromptAttachmentAsText>[0],
+      );
     })
     .join("\n\n");
 }
 
 /**
  * Map a Cursor SDK SDKToolUseMessage to a Paseo ToolCallDetail.
- * Cursor reports shell commands, file edits, reads, etc. through the
- * generic tool_call message — we do a best-effort mapping.
+ *
+ * Per the SDK docs: "Tool call schema is not stable. Treat args and result
+ * as unknown and parse defensively. The event envelope (type, call_id, name,
+ * status) is stable."
+ *
+ * We do a best-effort mapping based on common tool names observed in practice,
+ * with a safe fallback to the "unknown" detail type.
  */
 function mapCursorToolDetail(msg: SDKToolUseMessage): ToolCallDetail {
   const name = msg.name.toLowerCase();
@@ -103,21 +119,33 @@ function mapCursorToolDetail(msg: SDKToolUseMessage): ToolCallDetail {
     typeof result === "string"
       ? result
       : result && typeof result === "object"
-        ? (result["output"] as string | undefined) ??
+        ? ((result["output"] as string | undefined) ??
           (result["text"] as string | undefined) ??
-          JSON.stringify(result)
+          (result["stdout"] as string | undefined))
         : undefined;
 
+  const exitCode =
+    result && typeof result === "object"
+      ? ((result["exitCode"] as number | null | undefined) ??
+        (result["exit_code"] as number | null | undefined))
+      : undefined;
+
   // Shell / terminal commands
-  if (name === "run_terminal_cmd" || name === "terminal" || name === "shell" || name === "bash") {
+  if (
+    name === "run_terminal_cmd" ||
+    name === "terminal" ||
+    name === "shell" ||
+    name === "bash" ||
+    name.includes("command")
+  ) {
     return {
       type: "shell",
-      command: (args?.["command"] as string | undefined) ?? name,
+      command:
+        (args?.["command"] as string | undefined) ??
+        (args?.["cmd"] as string | undefined) ??
+        name,
       output: resultText,
-      exitCode: (result as Record<string, unknown> | undefined)?.["exitCode"] as
-        | number
-        | null
-        | undefined,
+      exitCode,
     };
   }
 
@@ -125,17 +153,37 @@ function mapCursorToolDetail(msg: SDKToolUseMessage): ToolCallDetail {
   if (name === "read_file" || name === "read") {
     return {
       type: "read",
-      filePath: (args?.["target_file"] as string | undefined) ?? (args?.["path"] as string | undefined) ?? "",
+      filePath:
+        (args?.["target_file"] as string | undefined) ??
+        (args?.["path"] as string | undefined) ??
+        (args?.["filePath"] as string | undefined) ??
+        "",
       content: resultText,
+      offset: args?.["offset"] as number | undefined,
+      limit: args?.["limit"] as number | undefined,
     };
   }
 
   // File edits
-  if (name === "edit_file" || name === "edit" || name === "apply_edit") {
+  if (
+    name === "edit_file" ||
+    name === "edit" ||
+    name === "apply_edit" ||
+    name.includes("edit")
+  ) {
     return {
       type: "edit",
-      filePath: (args?.["target_file"] as string | undefined) ?? (args?.["path"] as string | undefined) ?? "",
-      newString: (args?.["code_edit"] as string | undefined) ?? (args?.["new_string"] as string | undefined),
+      filePath:
+        (args?.["target_file"] as string | undefined) ??
+        (args?.["path"] as string | undefined) ??
+        "",
+      newString:
+        (args?.["code_edit"] as string | undefined) ??
+        (args?.["new_string"] as string | undefined) ??
+        (args?.["newString"] as string | undefined),
+      oldString:
+        (args?.["old_string"] as string | undefined) ??
+        (args?.["oldString"] as string | undefined),
     };
   }
 
@@ -144,24 +192,51 @@ function mapCursorToolDetail(msg: SDKToolUseMessage): ToolCallDetail {
     return {
       type: "write",
       filePath: (args?.["path"] as string | undefined) ?? "",
-      content: (args?.["content"] as string | undefined),
+      content: args?.["content"] as string | undefined,
     };
   }
 
-  // Search / grep
-  if (name === "grep_search" || name === "codebase_search" || name === "file_search" || name === "search") {
+  // Search / grep / glob
+  if (
+    name === "grep_search" ||
+    name === "codebase_search" ||
+    name === "file_search" ||
+    name === "search" ||
+    name.includes("grep") ||
+    name.includes("search") ||
+    name.includes("glob")
+  ) {
     return {
       type: "search",
-      query: (args?.["query"] as string | undefined) ?? (args?.["pattern"] as string | undefined) ?? name,
+      query:
+        (args?.["query"] as string | undefined) ??
+        (args?.["pattern"] as string | undefined) ??
+        name,
       content: resultText,
     };
   }
 
-  // Fallback
+  // Fallback — SDK docs say tool schema is not stable, so this is expected
   return {
     type: "unknown",
     input: args ?? null,
     output: result ?? null,
+  };
+}
+
+/**
+ * Extract AgentUsage from a TurnEndedUpdate's usage field.
+ * The onDelta callback receives this with full token counts.
+ */
+function mapTurnUsage(usage: TurnEndedUpdate["usage"]): AgentUsage | undefined {
+  if (!usage) return undefined;
+  const { inputTokens, outputTokens, cacheReadTokens } = usage;
+  if (!inputTokens && !outputTokens) return undefined;
+  return {
+    inputTokens,
+    outputTokens,
+    cachedInputTokens: cacheReadTokens,
+    // cacheWriteTokens has no direct Paseo field; store in metadata if needed
   };
 }
 
@@ -180,6 +255,8 @@ export class CursorSdkAgentSession implements AgentSession {
 
   private readonly subscribers = new Set<(event: AgentStreamEvent) => void>();
   private activeTurnId: string | null = null;
+  private currentRun: Run | null = null;
+  private latestUsage: AgentUsage | undefined;
   private latestModel: string | undefined;
 
   constructor(
@@ -203,8 +280,8 @@ export class CursorSdkAgentSession implements AgentSession {
   }
 
   /**
-   * Translate a single Cursor SDK SDKMessage into zero or more Paseo
-   * AgentStreamEvents and emit them.
+   * Translate a single Cursor SDK SDKMessage into Paseo AgentStreamEvents.
+   * Based on the official cookbook's emitSdkMessage pattern.
    */
   private handleSdkMessage(msg: SDKMessage): void {
     const turnId = this.currentTurnId();
@@ -234,8 +311,8 @@ export class CursorSdkAgentSession implements AgentSession {
               item: { type: "assistant_message", text: block.text },
             });
           }
-          // tool_use blocks inside assistant messages are handled via
-          // dedicated tool_call messages — skip here to avoid duplication.
+          // ToolUseBlock inside assistant messages are also reported via
+          // dedicated tool_call messages — skip to avoid duplication.
         }
         return;
       }
@@ -264,16 +341,16 @@ export class CursorSdkAgentSession implements AgentSession {
         };
         const item =
           toolMsg.status === "error"
-            ? { ...baseItem, status: "failed" as const, error: String(toolMsg.result ?? "Tool call failed") }
+            ? {
+                ...baseItem,
+                status: "failed" as const,
+                error: String(toolMsg.result ?? "Tool call failed"),
+              }
             : toolMsg.status === "running"
               ? { ...baseItem, status: "running" as const, error: null }
               : { ...baseItem, status: "completed" as const, error: null };
-        this.emit({
-          type: "timeline",
-          provider: CURSOR_PROVIDER,
-          turnId,
-          item,
-        });
+
+        this.emit({ type: "timeline", provider: CURSOR_PROVIDER, turnId, item });
         return;
       }
 
@@ -291,30 +368,26 @@ export class CursorSdkAgentSession implements AgentSession {
       }
 
       case "status": {
+        // status messages signal cloud lifecycle transitions.
+        // For local runs, the stream ends naturally — we rely on run.wait()
+        // rather than status messages to detect completion.
         const statusMsg = msg as SDKStatusMessage;
-        const completedTurnId = this.activeTurnId ?? turnId;
-
-        if (statusMsg.status === "FINISHED") {
-          this.activeTurnId = null;
-          this.emit({
-            type: "turn_completed",
-            provider: CURSOR_PROVIDER,
-            turnId: completedTurnId,
-          });
-        } else if (statusMsg.status === "ERROR") {
+        if (statusMsg.status === "ERROR") {
+          const failedTurnId = this.activeTurnId ?? turnId;
           this.activeTurnId = null;
           this.emit({
             type: "turn_failed",
             provider: CURSOR_PROVIDER,
-            turnId: completedTurnId,
+            turnId: failedTurnId,
             error: statusMsg.message ?? "Cursor agent error",
           });
         } else if (statusMsg.status === "CANCELLED") {
+          const cancelledTurnId = this.activeTurnId ?? turnId;
           this.activeTurnId = null;
           this.emit({
             type: "turn_canceled",
             provider: CURSOR_PROVIDER,
-            turnId: completedTurnId,
+            turnId: cancelledTurnId,
             reason: statusMsg.message ?? "Cancelled",
           });
         }
@@ -378,7 +451,7 @@ export class CursorSdkAgentSession implements AgentSession {
     return {
       sessionId: this.sdkAgent.agentId,
       finalText,
-      usage: undefined, // Cursor SDK does not expose token counts yet
+      usage: this.latestUsage,
       timeline,
     };
   }
@@ -399,18 +472,59 @@ export class CursorSdkAgentSession implements AgentSession {
 
     void (async () => {
       try {
-        const run = await this.sdkAgent.send(text);
+        const run = await this.sdkAgent.send(text, {
+          // Use onDelta to capture token usage from TurnEndedUpdate
+          onDelta: ({ update }) => {
+            if (update.type === "turn-ended") {
+              const usage = mapTurnUsage((update as TurnEndedUpdate).usage);
+              if (usage) this.latestUsage = usage;
+            }
+          },
+        });
+
+        this.currentRun = run;
+
         for await (const msg of run.stream()) {
           this.handleSdkMessage(msg);
         }
-        // If stream ends without a status=FINISHED message, emit completion
+
+        // Use run.wait() to get the authoritative final status and duration.
+        // This is the pattern from the official cookbook.
+        const result = await run.wait();
+
         if (this.activeTurnId === turnId) {
           this.activeTurnId = null;
-          this.emit({ type: "turn_completed", provider: CURSOR_PROVIDER, turnId });
+        }
+        this.currentRun = null;
+
+        if (result.status === "error") {
+          this.emit({
+            type: "turn_failed",
+            provider: CURSOR_PROVIDER,
+            turnId,
+            error: "Run finished with error status",
+          });
+        } else if (result.status === "cancelled") {
+          this.emit({
+            type: "turn_canceled",
+            provider: CURSOR_PROVIDER,
+            turnId,
+            reason: "Run was cancelled",
+          });
+        } else {
+          // "finished"
+          if (result.model) this.latestModel = result.model.id;
+          this.emit({
+            type: "turn_completed",
+            provider: CURSOR_PROVIDER,
+            turnId,
+            usage: this.latestUsage,
+          });
         }
       } catch (error) {
         const failedTurnId = this.activeTurnId ?? turnId;
         this.activeTurnId = null;
+        this.currentRun = null;
         this.emit({
           type: "turn_failed",
           provider: CURSOR_PROVIDER,
@@ -428,16 +542,108 @@ export class CursorSdkAgentSession implements AgentSession {
     return () => this.subscribers.delete(callback);
   }
 
+  /**
+   * Replay history using run.conversation() on the most recent run.
+   * The SDK returns structured ConversationTurn[] with steps.
+   */
   async *streamHistory(): AsyncGenerator<AgentStreamEvent> {
-    // Cursor SDK does not expose a history replay API yet.
-    // Return empty — the UI will show an empty timeline on resume.
+    try {
+      // List runs for this agent and replay the most recent one
+      const { items } = await Agent.listRuns(this.sdkAgent.agentId, {
+        runtime: "local",
+        cwd: this.config.cwd,
+        limit: 1,
+      });
+
+      if (items.length === 0) return;
+
+      const latestRun = items[0];
+      const turns = await latestRun.conversation();
+
+      for (const turn of turns) {
+        if (turn.type === "agentConversationTurn") {
+          const { userMessage, steps } = turn.turn;
+
+          if (userMessage?.text) {
+            yield {
+              type: "timeline",
+              provider: CURSOR_PROVIDER,
+              item: { type: "user_message", text: userMessage.text },
+            };
+          }
+
+          for (const step of steps) {
+            if (step.type === "assistantMessage") {
+              yield {
+                type: "timeline",
+                provider: CURSOR_PROVIDER,
+                item: { type: "assistant_message", text: step.message.text },
+              };
+            } else if (step.type === "thinkingMessage") {
+              yield {
+                type: "timeline",
+                provider: CURSOR_PROVIDER,
+                item: { type: "reasoning", text: step.message.text },
+              };
+            } else if (step.type === "toolCall") {
+              // ToolCall is an internal discriminated union — treat as unknown
+              const toolCall = step.message as unknown as {
+                name?: string;
+                callId?: string;
+                input?: unknown;
+                output?: unknown;
+              };
+              yield {
+                type: "timeline",
+                provider: CURSOR_PROVIDER,
+                item: {
+                  type: "tool_call",
+                  callId: toolCall.callId ?? randomUUID(),
+                  name: toolCall.name ?? "tool",
+                  status: "completed",
+                  detail: { type: "unknown", input: toolCall.input ?? null, output: toolCall.output ?? null },
+                  error: null,
+                },
+              };
+            }
+          }
+        } else if (turn.type === "shellConversationTurn") {
+          const { shellCommand, shellOutput } = turn.turn;
+          if (shellCommand) {
+            yield {
+              type: "timeline",
+              provider: CURSOR_PROVIDER,
+              item: {
+                type: "tool_call",
+                callId: randomUUID(),
+                name: "shell",
+                status: shellOutput ? "completed" : "running",
+                detail: {
+                  type: "shell",
+                  command: shellCommand.command,
+                  output: shellOutput?.stdout,
+                  exitCode: shellOutput?.exitCode ?? null,
+                },
+                error: null,
+              },
+            };
+          }
+        }
+      }
+    } catch (error) {
+      this.logger.debug({ err: error }, "Cursor streamHistory failed");
+    }
   }
 
   async getRuntimeInfo(): Promise<AgentRuntimeInfo> {
     return {
       provider: CURSOR_PROVIDER,
       sessionId: this.sdkAgent.agentId ?? null,
-      model: this.sdkAgent.model?.id ?? this.latestModel ?? this.config.model ?? null,
+      model:
+        this.sdkAgent.model?.id ??
+        this.latestModel ??
+        this.config.model ??
+        null,
       modeId: null,
     };
   }
@@ -462,7 +668,8 @@ export class CursorSdkAgentSession implements AgentSession {
     _requestId: string,
     _response: AgentPermissionResponse,
   ): Promise<void> {
-    // Cursor handles tool approvals internally; no external permission API yet.
+    // Cursor handles tool approvals internally via hooks (.cursor/hooks.json).
+    // There is no external permission API in the SDK.
   }
 
   describePersistence(): AgentPersistenceHandle | null {
@@ -477,26 +684,43 @@ export class CursorSdkAgentSession implements AgentSession {
     };
   }
 
+  /**
+   * Cancel the active run using run.cancel().
+   * The SDK docs confirm: "Cancel is supported on running local and cloud runs."
+   */
   async interrupt(): Promise<void> {
-    // Cursor SDK does not expose a cancel-in-flight API on SDKAgent directly.
-    // The run.cancel() path requires holding the Run reference; we fire-and-forget
-    // the turn so we can't reach it here. This is a known limitation.
-    this.logger.warn("Cursor SDK provider: interrupt() is not yet supported");
+    const run = this.currentRun;
+    if (!run) {
+      this.logger.debug("Cursor interrupt(): no active run");
+      return;
+    }
+    if (!run.supports("cancel")) {
+      this.logger.warn(
+        `Cursor interrupt(): cancel not supported — ${run.unsupportedReason("cancel") ?? "unknown reason"}`,
+      );
+      return;
+    }
+    await run.cancel();
   }
 
   async close(): Promise<void> {
-    this.sdkAgent.close();
+    await this.sdkAgent[Symbol.asyncDispose]();
   }
 
   async listCommands(): Promise<AgentSlashCommand[]> {
     return [];
   }
 
+  /**
+   * Switch model for the next send() call.
+   * Per SDK docs: model override on agent.send() is sticky — it updates
+   * agent.model for subsequent sends. We store it in config for getRuntimeInfo().
+   */
   async setModel(modelId: string | null): Promise<void> {
-    // Model switching mid-session is not supported by the Cursor SDK.
-    // The model is fixed at Agent.create() time.
-    void modelId;
-    this.logger.warn("Cursor SDK provider: setModel() is not supported mid-session");
+    if (modelId) {
+      this.config.model = modelId;
+      this.latestModel = modelId;
+    }
   }
 }
 
@@ -525,7 +749,11 @@ export class CursorSdkAgentClient implements AgentClient {
   ): Promise<AgentSession> {
     const sdkAgent = await Agent.create({
       ...(config.model ? { model: { id: config.model } } : {}),
-      local: { cwd: config.cwd },
+      local: {
+        cwd: config.cwd,
+        // Load project hooks (.cursor/hooks.json) and user MCP config
+        settingSources: ["project", "user"],
+      },
       ...(config.mcpServers ? { mcpServers: config.mcpServers } : {}),
     });
 
@@ -550,13 +778,14 @@ export class CursorSdkAgentClient implements AgentClient {
     const mergedConfig: AgentSessionConfig = {
       provider: CURSOR_PROVIDER,
       cwd,
-      model: overrides?.model,
       ...overrides,
     };
 
+    // Agent.resume() auto-detects runtime from ID prefix (bc- = cloud, else local)
     const sdkAgent = await Agent.resume(agentId, {
       ...(mergedConfig.model ? { model: { id: mergedConfig.model } } : {}),
-      local: { cwd },
+      local: { cwd, settingSources: ["project", "user"] },
+      ...(mergedConfig.mcpServers ? { mcpServers: mergedConfig.mcpServers } : {}),
     });
 
     return new CursorSdkAgentSession(sdkAgent, mergedConfig, this.logger);
@@ -564,24 +793,81 @@ export class CursorSdkAgentClient implements AgentClient {
 
   async listModels(_options: ListModelsOptions): Promise<AgentModelDefinition[]> {
     try {
-      const models = await import("@cursor/sdk").then((m) => m.Cursor.models.list());
-      return models.map((m) => ({
-        provider: CURSOR_PROVIDER,
-        id: m.id,
-        label: m.displayName ?? m.id,
-        description: m.id,
-        isDefault: m.id === "composer-2",
-      }));
+      const models = await Cursor.models.list();
+      const result: AgentModelDefinition[] = [];
+
+      for (const m of models) {
+        // If the model has variants (e.g. composer-2 with thinking=low/high),
+        // expose each variant as a separate selectable model — same pattern
+        // as the official cookbook's modelToChoices().
+        if (m.variants && m.variants.length > 0) {
+          for (const variant of m.variants) {
+            result.push({
+              provider: CURSOR_PROVIDER,
+              id: JSON.stringify({ id: m.id, params: variant.params }),
+              label: `${m.displayName ?? m.id} — ${variant.displayName}`,
+              description: variant.description ?? m.description,
+              isDefault: variant.isDefault ?? m.id === "composer-2",
+            });
+          }
+        } else {
+          result.push({
+            provider: CURSOR_PROVIDER,
+            id: m.id,
+            label: m.displayName ?? m.id,
+            description: m.description,
+            isDefault: m.id === "composer-2",
+          });
+        }
+      }
+
+      return result;
     } catch (error) {
       this.logger.debug({ err: error }, "Cursor listModels failed, returning empty list");
       return [];
     }
   }
 
+  /**
+   * List persisted local agents using Agent.list().
+   * This gives Paseo the ability to show previously created Cursor agents.
+   */
+  async listPersistedAgents(
+    options?: ListPersistedAgentsOptions,
+  ): Promise<PersistedAgentDescriptor[]> {
+    try {
+      const { items } = await Agent.list({
+        runtime: "local",
+        cwd: process.cwd(),
+        limit: options?.limit ?? 20,
+      });
+
+      return items.map((info) => ({
+        provider: CURSOR_PROVIDER,
+        sessionId: info.agentId,
+        cwd: (info as { cwd?: string }).cwd ?? process.cwd(),
+        title: info.name ?? info.summary ?? null,
+        lastActivityAt: new Date(info.lastModified),
+        persistence: {
+          provider: CURSOR_PROVIDER,
+          sessionId: info.agentId,
+          nativeHandle: info.agentId,
+          metadata: {
+            agentId: info.agentId,
+            cwd: (info as { cwd?: string }).cwd,
+          } satisfies CursorPersistenceMetadata,
+        },
+        timeline: [],
+      }));
+    } catch (error) {
+      this.logger.debug({ err: error }, "Cursor listPersistedAgents failed");
+      return [];
+    }
+  }
+
   async isAvailable(): Promise<boolean> {
     try {
-      // Attempt a lightweight SDK call to verify Cursor is installed and auth works.
-      await import("@cursor/sdk").then((m) => m.Cursor.models.list());
+      await Cursor.models.list();
       return true;
     } catch {
       return false;
@@ -592,20 +878,28 @@ export class CursorSdkAgentClient implements AgentClient {
     try {
       const available = await this.isAvailable();
       let modelsValue = "Not checked";
+      let userValue = "Not checked";
       const status = formatDiagnosticStatus(available);
 
       if (available) {
         try {
-          const models = await this.listModels({ cwd: process.cwd(), force: false });
+          const models = await this.listModels({ cwd: homedir(), force: false });
           modelsValue = String(models.length);
         } catch (error) {
-          modelsValue = `Error - ${toDiagnosticErrorMessage(error)}`;
+          modelsValue = `Error — ${toDiagnosticErrorMessage(error)}`;
+        }
+        try {
+          const user = await Cursor.me();
+          userValue = user.userEmail ?? user.apiKeyName;
+        } catch {
+          userValue = "Not available";
         }
       }
 
       return {
         diagnostic: formatProviderDiagnostic("Cursor", [
           { label: "SDK", value: "@cursor/sdk" },
+          { label: "Auth", value: userValue },
           { label: "Models", value: modelsValue },
           { label: "Status", value: status },
         ]),
