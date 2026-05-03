@@ -64,9 +64,19 @@ export function buildWorkspaceGitMetadataFromSnapshot(input: {
     remoteUrl: input.remoteUrl,
     mainRepoRoot: input.mainRepoRoot,
   });
-  const projectDisplayName = projectKey.startsWith("remote:")
-    ? deriveProjectGroupingName(projectKey)
-    : input.directoryName;
+  /* [local/custom-display] Allow overriding project display name source.
+   * PASEO_WORKSPACE_DISPLAY=path  → always use local directory name (basename of cwd)
+   * PASEO_WORKSPACE_DISPLAY=repo  → use github repo name (default behavior)
+   * unset                         → default (github repo name if available, else directory) */
+  const displayPref = process.env.PASEO_WORKSPACE_DISPLAY?.toLowerCase();
+  let projectDisplayName: string;
+  if (displayPref === "path") {
+    projectDisplayName = input.directoryName;
+  } else if (projectKey.startsWith("remote:")) {
+    projectDisplayName = deriveProjectGroupingName(projectKey);
+  } else {
+    projectDisplayName = input.directoryName;
+  }
 
   return {
     projectKind: "git",
