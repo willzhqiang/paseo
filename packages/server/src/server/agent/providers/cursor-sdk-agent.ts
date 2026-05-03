@@ -30,6 +30,7 @@ import type {
   SDKThinkingMessage,
   SDKStatusMessage,
   SDKTaskMessage,
+  ModelSelection,
   Run,
   TurnEndedUpdate,
 } from "@cursor/sdk";
@@ -141,9 +142,7 @@ function mapCursorToolDetail(msg: SDKToolUseMessage): ToolCallDetail {
     return {
       type: "shell",
       command:
-        (args?.["command"] as string | undefined) ??
-        (args?.["cmd"] as string | undefined) ??
-        name,
+        (args?.["command"] as string | undefined) ?? (args?.["cmd"] as string | undefined) ?? name,
       output: resultText,
       exitCode,
     };
@@ -165,12 +164,7 @@ function mapCursorToolDetail(msg: SDKToolUseMessage): ToolCallDetail {
   }
 
   // File edits
-  if (
-    name === "edit_file" ||
-    name === "edit" ||
-    name === "apply_edit" ||
-    name.includes("edit")
-  ) {
+  if (name === "edit_file" || name === "edit" || name === "apply_edit" || name.includes("edit")) {
     return {
       type: "edit",
       filePath:
@@ -182,8 +176,7 @@ function mapCursorToolDetail(msg: SDKToolUseMessage): ToolCallDetail {
         (args?.["new_string"] as string | undefined) ??
         (args?.["newString"] as string | undefined),
       oldString:
-        (args?.["old_string"] as string | undefined) ??
-        (args?.["oldString"] as string | undefined),
+        (args?.["old_string"] as string | undefined) ?? (args?.["oldString"] as string | undefined),
     };
   }
 
@@ -247,18 +240,23 @@ function mapTurnUsage(usage: TurnEndedUpdate["usage"]): AgentUsage | undefined {
  * ToolCall is a fully typed discriminated union with known arg and result shapes.
  * This gives us much richer detail than the stream-time mapping.
  */
-function mapCursorConversationToolCall(
-  tc: { type: string; args?: unknown; result?: { status: string; value?: unknown; error?: unknown } },
-): ToolCallDetail {
+function mapCursorConversationToolCall(tc: {
+  type: string;
+  args?: unknown;
+  result?: { status: string; value?: unknown; error?: unknown };
+}): ToolCallDetail {
   const args = tc.args as Record<string, unknown> | undefined;
-  const resultValue = tc.result?.status === "success"
-    ? (tc.result as { value?: unknown }).value as Record<string, unknown> | undefined
-    : undefined;
+  const resultValue =
+    tc.result?.status === "success"
+      ? ((tc.result as { value?: unknown }).value as Record<string, unknown> | undefined)
+      : undefined;
 
   switch (tc.type) {
     case "shell": {
       const shellArgs = args as { command?: string; workingDirectory?: string } | undefined;
-      const shellResult = resultValue as { stdout?: string; stderr?: string; exitCode?: number; signal?: string } | undefined;
+      const shellResult = resultValue as
+        | { stdout?: string; stderr?: string; exitCode?: number; signal?: string }
+        | undefined;
       return {
         type: "shell",
         command: shellArgs?.command ?? "shell",
@@ -278,7 +276,9 @@ function mapCursorConversationToolCall(
     }
     case "edit": {
       const editArgs = args as { path?: string } | undefined;
-      const editResult = resultValue as { diffString?: string; linesAdded?: number; linesRemoved?: number } | undefined;
+      const editResult = resultValue as
+        | { diffString?: string; linesAdded?: number; linesRemoved?: number }
+        | undefined;
       return {
         type: "edit",
         filePath: editArgs?.path ?? "",
@@ -324,10 +324,15 @@ function mapCursorConversationToolCall(
       };
     }
     case "mcp": {
-      const mcpArgs = args as { toolName?: string; providerIdentifier?: string; args?: unknown } | undefined;
+      const mcpArgs = args as
+        | { toolName?: string; providerIdentifier?: string; args?: unknown }
+        | undefined;
       return {
         type: "plain_text",
-        label: `MCP: ${mcpArgs?.providerIdentifier ?? ""}/${mcpArgs?.toolName ?? ""}`.replace(/^\//, ""),
+        label: `MCP: ${mcpArgs?.providerIdentifier ?? ""}/${mcpArgs?.toolName ?? ""}`.replace(
+          /^\//,
+          "",
+        ),
         text: JSON.stringify(mcpArgs?.args ?? {}),
       };
     }
@@ -338,6 +343,33 @@ function mapCursorConversationToolCall(
         output: resultValue ?? null,
       };
   }
+}
+
+/**
+ * Parse a Paseo model ID back into the SDK's { id, params? } shape.
+ *
+ * listModels() encodes variant models as JSON strings
+ * (e.g. '{"id":"composer-2","params":[{"thinking":"low"}]}') so that a single
+ * string can carry both the base model ID and its parameter set. Before passing
+ * to Agent.create / Agent.resume we must unwrap the JSON.
+ */
+function parseModelId(modelId: string): ModelSelection {
+  try {
+    const parsed = JSON.parse(modelId) as unknown;
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      const obj = parsed as Record<string, unknown>;
+      if (typeof obj["id"] === "string") {
+        const rawParams = obj["params"];
+        const params = Array.isArray(rawParams)
+          ? (rawParams as Array<{ id: string; value: string }>)
+          : undefined;
+        return { id: obj["id"], ...(params ? { params } : {}) };
+      }
+    }
+  } catch {
+    // plain string ID — fall through
+  }
+  return { id: modelId };
 }
 
 // ---------------------------------------------------------------------------
@@ -592,7 +624,8 @@ export class CursorSdkAgentSession implements AgentSession {
         // Per the cookbook: usage is a runtime field not in the type definition,
         // accessed via (result as { usage?: { inputTokens?: number; outputTokens?: number } }).
         const result = await run.wait();
-        const runUsage = (result as { usage?: { inputTokens?: number; outputTokens?: number } }).usage;
+        const runUsage = (result as { usage?: { inputTokens?: number; outputTokens?: number } })
+          .usage;
         if (runUsage?.inputTokens || runUsage?.outputTokens) {
           // Prefer run.wait() usage over onDelta usage if available
           this.latestUsage = {
@@ -712,7 +745,13 @@ export class CursorSdkAgentSession implements AgentSession {
                 detail,
               };
               const item = isFailed
-                ? { ...baseItem, status: "failed" as const, error: String((tc.result as { error?: unknown } | undefined)?.error ?? "Tool call failed") }
+                ? {
+                    ...baseItem,
+                    status: "failed" as const,
+                    error: String(
+                      (tc.result as { error?: unknown } | undefined)?.error ?? "Tool call failed",
+                    ),
+                  }
                 : { ...baseItem, status: "completed" as const, error: null };
               yield {
                 type: "timeline",
@@ -753,11 +792,7 @@ export class CursorSdkAgentSession implements AgentSession {
     return {
       provider: CURSOR_PROVIDER,
       sessionId: this.sdkAgent.agentId ?? null,
-      model:
-        this.sdkAgent.model?.id ??
-        this.latestModel ??
-        this.config.model ??
-        null,
+      model: this.sdkAgent.model?.id ?? this.latestModel ?? this.config.model ?? null,
       modeId: null,
     };
   }
@@ -778,10 +813,7 @@ export class CursorSdkAgentSession implements AgentSession {
     return [];
   }
 
-  async respondToPermission(
-    _requestId: string,
-    _response: AgentPermissionResponse,
-  ): Promise<void> {
+  async respondToPermission(_requestId: string, _response: AgentPermissionResponse): Promise<void> {
     // Cursor handles tool approvals internally via hooks (.cursor/hooks.json).
     // There is no external permission API in the SDK.
   }
@@ -852,20 +884,35 @@ export class CursorSdkAgentClient implements AgentClient {
   readonly capabilities = CURSOR_CAPABILITIES;
 
   private readonly logger: Logger;
+  private readonly apiKey: string | undefined;
 
   constructor(options: CursorSdkAgentClientOptions) {
     this.logger = options.logger;
+    // Prefer API key from config.json provider env, fall back to process.env
+    this.apiKey =
+      (options.runtimeSettings?.env?.["CURSOR_API_KEY"] as string | undefined) ??
+      process.env.CURSOR_API_KEY;
+    // Persist to process.env so Cursor SDK static methods (models.list, me)
+    // can always find it regardless of call site.
+    if (this.apiKey) {
+      process.env.CURSOR_API_KEY = this.apiKey;
+    }
   }
 
   async createSession(
     config: AgentSessionConfig,
     _launchContext?: AgentLaunchContext,
   ): Promise<AgentSession> {
+    // Resolve model: explicit value wins; otherwise query listModels for the
+    // default. This avoids Agent.create() falling back to the "default"
+    // sentinel ({id:"default",params:[]}) which the Cursor API rejects.
+    const resolvedModel = await this.resolveModel(config.model, config.cwd);
+
     const sdkAgent = await Agent.create({
       // Must pass apiKey explicitly — SDK does not reliably auto-read
       // CURSOR_API_KEY in CJS mode (confirmed by integration test).
-      apiKey: process.env.CURSOR_API_KEY,
-      ...(config.model ? { model: { id: config.model } } : {}),
+      apiKey: this.apiKey,
+      ...(resolvedModel ? { model: resolvedModel } : {}),
       local: {
         cwd: config.cwd,
         // Load project hooks (.cursor/hooks.json) and user MCP config
@@ -898,10 +945,12 @@ export class CursorSdkAgentClient implements AgentClient {
       ...overrides,
     };
 
+    const resolvedModel = await this.resolveModel(mergedConfig.model, cwd);
+
     // Agent.resume() auto-detects runtime from ID prefix (bc- = cloud, else local)
     const sdkAgent = await Agent.resume(agentId, {
-      apiKey: process.env.CURSOR_API_KEY,
-      ...(mergedConfig.model ? { model: { id: mergedConfig.model } } : {}),
+      apiKey: this.apiKey,
+      ...(resolvedModel ? { model: resolvedModel } : {}),
       local: { cwd, settingSources: ["project", "user"] },
       ...(mergedConfig.mcpServers ? { mcpServers: mergedConfig.mcpServers } : {}),
     });
@@ -911,7 +960,7 @@ export class CursorSdkAgentClient implements AgentClient {
 
   async listModels(_options: ListModelsOptions): Promise<AgentModelDefinition[]> {
     try {
-      const models = await Cursor.models.list();
+      const models = await this.withApiKeyEnv(() => Cursor.models.list());
       const result: AgentModelDefinition[] = [];
 
       for (const m of models) {
@@ -983,9 +1032,38 @@ export class CursorSdkAgentClient implements AgentClient {
     }
   }
 
+  /**
+   * Resolve a model string to the SDK's { id, params? } shape, or undefined.
+   *
+   * - Explicit, non-"default" values are parsed via parseModelId().
+   * - Missing / "default" values trigger a listModels() call to find the
+   *   isDefault model so we never pass the "default" sentinel to Agent.create.
+   */
+  private async resolveModel(
+    model: string | undefined,
+    cwd: string,
+  ): Promise<ModelSelection | undefined> {
+    if (model && model !== "default") {
+      return parseModelId(model);
+    }
+    const models = await this.listModels({ cwd, force: false });
+    const defaultModel = models.find((m) => m.isDefault) ?? models[0];
+    return defaultModel ? parseModelId(defaultModel.id) : undefined;
+  }
+
+  private async withApiKeyEnv<T>(fn: () => Promise<T>): Promise<T> {
+    const prev = process.env.CURSOR_API_KEY;
+    if (this.apiKey) process.env.CURSOR_API_KEY = this.apiKey;
+    try {
+      return await fn();
+    } finally {
+      if (this.apiKey) process.env.CURSOR_API_KEY = prev;
+    }
+  }
+
   async isAvailable(): Promise<boolean> {
     try {
-      await Cursor.models.list();
+      await this.withApiKeyEnv(() => Cursor.models.list());
       return true;
     } catch {
       return false;
@@ -1007,7 +1085,7 @@ export class CursorSdkAgentClient implements AgentClient {
           modelsValue = `Error — ${toDiagnosticErrorMessage(error)}`;
         }
         try {
-          const user = await Cursor.me();
+          const user = await this.withApiKeyEnv(() => Cursor.me());
           userValue = user.userEmail ?? user.apiKeyName;
         } catch {
           userValue = "Not available";
