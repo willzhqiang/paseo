@@ -862,6 +862,9 @@ export class CursorSdkAgentClient implements AgentClient {
     _launchContext?: AgentLaunchContext,
   ): Promise<AgentSession> {
     const sdkAgent = await Agent.create({
+      // Must pass apiKey explicitly — SDK does not reliably auto-read
+      // CURSOR_API_KEY in CJS mode (confirmed by integration test).
+      apiKey: process.env.CURSOR_API_KEY,
       ...(config.model ? { model: { id: config.model } } : {}),
       local: {
         cwd: config.cwd,
@@ -897,6 +900,7 @@ export class CursorSdkAgentClient implements AgentClient {
 
     // Agent.resume() auto-detects runtime from ID prefix (bc- = cloud, else local)
     const sdkAgent = await Agent.resume(agentId, {
+      apiKey: process.env.CURSOR_API_KEY,
       ...(mergedConfig.model ? { model: { id: mergedConfig.model } } : {}),
       local: { cwd, settingSources: ["project", "user"] },
       ...(mergedConfig.mcpServers ? { mcpServers: mergedConfig.mcpServers } : {}),
