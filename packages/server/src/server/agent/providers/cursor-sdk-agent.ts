@@ -893,32 +893,34 @@ export class CursorSdkAgentSession implements AgentSession {
    * This method finds the thinking/reasoning param and updates its value.
    */
   async setThinkingOption(thinkingOptionId: string | null): Promise<void> {
-    if (!thinkingOptionId || !this.currentModelSelection) {
-      return;
+    if (!this.currentModelSelection) return;
+
+    const params = [...(this.currentModelSelection.params ?? [])];
+
+    const thinkingIdx = params.findIndex((p) => p.id === "thinking");
+    const effortIdx = params.findIndex((p) => p.id === "effort");
+    const reasoningIdx = params.findIndex((p) => p.id === "reasoning");
+
+    if (thinkingIdx >= 0 && effortIdx >= 0) {
+      // Claude-style: thinkingOptionId is an effort level (low/medium/high/max).
+      // Toggle "thinking" boolean + update "effort" value.
+      if (thinkingOptionId) {
+        params[thinkingIdx] = { id: "thinking", value: "true" };
+        params[effortIdx] = { id: "effort", value: thinkingOptionId };
+      } else {
+        params[thinkingIdx] = { id: "thinking", value: "false" };
+      }
+    } else if (reasoningIdx >= 0) {
+      // GPT-style: thinkingOptionId is a reasoning level (none/low/medium/high/extra-high).
+      params[reasoningIdx] = { id: "reasoning", value: thinkingOptionId ?? "none" };
+    } else if (thinkingIdx >= 0) {
+      // Simple boolean toggle (haiku, grok, etc.).
+      params[thinkingIdx] = { id: "thinking", value: thinkingOptionId ?? "false" };
     }
-
-    const params = this.currentModelSelection.params ?? [];
-
-    // Find the thinking/reasoning param (different models use different names)
-    const thinkingParamIndex = params.findIndex(
-      (p) => p.id === "thinking" || p.id === "reasoning" || p.id === "effort",
-    );
-
-    if (thinkingParamIndex >= 0) {
-      // Update existing param
-      params[thinkingParamIndex] = { ...params[thinkingParamIndex], value: thinkingOptionId };
-    } else {
-      // No existing thinking param — try to determine which param name to use
-      // based on model ID naming convention
-      const modelId = this.currentModelSelection.id;
-      const paramId = modelId.includes("claude") || modelId.includes("sonnet") || modelId.includes("opus") || modelId.includes("haiku")
-        ? "effort"  // Claude models use 'effort'
-        : "reasoning"; // GPT/Codex models use 'reasoning'
-      params.push({ id: paramId, value: thinkingOptionId });
-    }
+    // else: model has no thinking-related param (composer-2) — no-op.
 
     this.currentModelSelection = { ...this.currentModelSelection, params };
-    this.config.thinkingOptionId = thinkingOptionId;
+    this.config.thinkingOptionId = thinkingOptionId ?? undefined;
   }
 }
 
@@ -1020,19 +1022,57 @@ export class CursorSdkAgentClient implements AgentClient {
         // Variants are parameter combinations (thinking/context/reasoning/fast).
         // Expanding all variants causes 169 entries with many duplicates.
         //
-        // Instead: expose model with its default variant, and add parameter
-        // options as thinkingOptions so users can pick via the thinking selector.
+        // Instead: expose model with its default variant, and surface thinking
+        // depth options via thinkingOptions so the user can pick from the selector.
         const defaultVariant = m.variants?.find((v) => v.isDefault) ?? m.variants?.[0];
         const params = defaultVariant?.params;
 
-        // Extract thinking/reasoning options for the thinkingOptions selector
-        const thinkingParam = m.parameters?.find(
-          (p) => p.id === "thinking" || p.id === "reasoning",
-        );
-        const thinkingOptions = thinkingParam?.values.map((v) => ({
-          id: v.value,
-          label: v.displayName ?? v.value,
-        }));
+        // Determine thinkingOptions based on which parameter controls depth:
+        //
+        // 1. "effort" param  (Claude family) — thinking depth is low/medium/high/max.
+        //    The "thinking" boolean is toggled automatically by setThinkingOption.
+        //    The ":icon-brain:" displayName on thinking=true is Cursor's internal icon
+        //    notation and must NOT be used as the option label.
+        //
+        // 2. "reasoning" param (GPT family) — depth is none/low/medium/high/extra-high.
+        //
+        // 3. Only "thinking" boolean (haiku, grok, etc.) — expose Off / On.
+        //
+        // 4. Only "fast" (composer-2) — no meaningful depth selector; omit.
+
+        const effortParam = m.parameters?.find((p) => p.id === "effort");
+        const reasoningParam = m.parameters?.find((p) => p.id === "reasoning");
+        const thinkingBoolParam = m.parameters?.find((p) => p.id === "thinking");
+
+        let thinkingOptions: { id: string; label: string }[] | undefined;
+        let defaultThinkingOptionId: string | undefined;
+
+        if (effortParam) {
+          // Claude-style: effort controls thinking depth.
+          thinkingOptions = effortParam.values.map((v) => ({
+            id: v.value,
+            label: v.displayName ?? v.value,
+          }));
+          defaultThinkingOptionId =
+            defaultVariant?.params.find((p) => p.id === "effort")?.value;
+        } else if (reasoningParam) {
+          // GPT-style: reasoning level.
+          thinkingOptions = reasoningParam.values.map((v) => ({
+            id: v.value,
+            label: v.displayName ?? v.value,
+          }));
+          defaultThinkingOptionId =
+            defaultVariant?.params.find((p) => p.id === "reasoning")?.value;
+        } else if (thinkingBoolParam) {
+          // Simple on/off toggle (haiku, grok, etc.).
+          thinkingOptions = [
+            { id: "false", label: "Off" },
+            { id: "true", label: "On" },
+          ];
+          defaultThinkingOptionId =
+            defaultVariant?.params.find((p) => p.id === "thinking")?.value ?? "false";
+        }
+        // else: no meaningful thinking depth (composer-2 / fast-only) — omit.
 
         result.push({
           provider: CURSOR_PROVIDER,
@@ -1041,6 +1081,7 @@ export class CursorSdkAgentClient implements AgentClient {
           description: m.description,
           isDefault: m.id === "composer-2",
           ...(thinkingOptions?.length ? { thinkingOptions } : {}),
+          ...(defaultThinkingOptionId !== undefined ? { defaultThinkingOptionId } : {}),
         });
       }
 
