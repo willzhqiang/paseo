@@ -964,28 +964,32 @@ export class CursorSdkAgentClient implements AgentClient {
       const result: AgentModelDefinition[] = [];
 
       for (const m of models) {
-        // If the model has variants (e.g. composer-2 with thinking=low/high),
-        // expose each variant as a separate selectable model — same pattern
-        // as the official cookbook's modelToChoices().
-        if (m.variants && m.variants.length > 0) {
-          for (const variant of m.variants) {
-            result.push({
-              provider: CURSOR_PROVIDER,
-              id: JSON.stringify({ id: m.id, params: variant.params }),
-              label: `${m.displayName ?? m.id} — ${variant.displayName}`,
-              description: variant.description ?? m.description,
-              isDefault: variant.isDefault ?? m.id === "composer-2",
-            });
-          }
-        } else {
-          result.push({
-            provider: CURSOR_PROVIDER,
-            id: m.id,
-            label: m.displayName ?? m.id,
-            description: m.description,
-            isDefault: m.id === "composer-2",
-          });
-        }
+        // Show one entry per model (not per variant).
+        // Variants are parameter combinations (thinking/context/reasoning/fast).
+        // Expanding all variants causes 169 entries with many duplicates.
+        //
+        // Instead: expose model with its default variant, and add parameter
+        // options as thinkingOptions so users can pick via the thinking selector.
+        const defaultVariant = m.variants?.find((v) => v.isDefault) ?? m.variants?.[0];
+        const params = defaultVariant?.params;
+
+        // Extract thinking/reasoning options for the thinkingOptions selector
+        const thinkingParam = m.parameters?.find(
+          (p) => p.id === "thinking" || p.id === "reasoning",
+        );
+        const thinkingOptions = thinkingParam?.values.map((v) => ({
+          id: v.value,
+          label: v.displayName ?? v.value,
+        }));
+
+        result.push({
+          provider: CURSOR_PROVIDER,
+          id: params ? JSON.stringify({ id: m.id, params }) : m.id,
+          label: m.displayName ?? m.id,
+          description: m.description,
+          isDefault: m.id === "composer-2",
+          ...(thinkingOptions?.length ? { thinkingOptions } : {}),
+        });
       }
 
       return result;
