@@ -61,9 +61,19 @@ export function buildWorkspaceGitMetadataFromSnapshot(input: {
   const isWorktree =
     input.mainRepoRoot !== null && input.repoRoot !== null && input.mainRepoRoot !== input.repoRoot;
 
+  /* [local/custom-display] Allow overriding project display name source.
+   * PASEO_WORKSPACE_DISPLAY=path  → always use local directory name (basename of cwd)
+   * PASEO_WORKSPACE_DISPLAY=repo  → use github repo name (default behavior)
+   * unset                         → default (github repo name if available, else directory) */
+  const displayPref = process.env.PASEO_WORKSPACE_DISPLAY?.toLowerCase();
+  const useLocalPath = displayPref === "path";
+  const projectDisplayName = useLocalPath
+    ? input.directoryName
+    : (githubRepo ?? input.directoryName);
+
   return {
     projectKind: "git",
-    projectDisplayName: githubRepo ?? input.directoryName,
+    projectDisplayName,
     workspaceDisplayName: input.currentBranch ?? input.directoryName,
     gitRemote: input.remoteUrl,
     isWorktree,
