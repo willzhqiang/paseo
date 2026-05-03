@@ -395,7 +395,16 @@ export class CursorSdkAgentSession implements AgentSession {
     private readonly sdkAgent: SDKAgent,
     private readonly config: AgentSessionConfig,
     private readonly logger: Logger,
-  ) {}
+  ) {
+    // Initialize model selection from the config model (which may be a JSON string with params)
+    this.currentModelSelection = config.model ? parseModelId(config.model) : undefined;
+  }
+
+  /**
+   * Current model + params selection. Updated by setModel() and setThinkingOption().
+   * Passed to agent.send() on every turn.
+   */
+  private currentModelSelection: { id: string; params?: Array<{ id: string; value: string }> } | undefined;
 
   get id(): string | null {
     return this.sdkAgent.agentId ?? null;
@@ -605,6 +614,8 @@ export class CursorSdkAgentSession implements AgentSession {
     void (async () => {
       try {
         const run = await this.sdkAgent.send(text, {
+          // Pass current model selection (includes thinking/reasoning params)
+          ...(this.currentModelSelection ? { model: this.currentModelSelection } : {}),
           // Use onDelta to capture token usage from TurnEndedUpdate
           onDelta: ({ update }) => {
             if (update.type === "turn-ended") {
@@ -860,13 +871,54 @@ export class CursorSdkAgentSession implements AgentSession {
   /**
    * Switch model for the next send() call.
    * Per SDK docs: model override on agent.send() is sticky — it updates
-   * agent.model for subsequent sends. We store it in config for getRuntimeInfo().
+   * agent.model for subsequent sends.
    */
   async setModel(modelId: string | null): Promise<void> {
     if (modelId) {
       this.config.model = modelId;
-      this.latestModel = modelId;
+      this.currentModelSelection = parseModelId(modelId);
+      this.latestModel = this.currentModelSelection?.id ?? modelId;
     }
+  }
+
+  /**
+   * Switch thinking/reasoning level by updating the params in currentModelSelection.
+   *
+   * Cursor SDK uses model.params to control thinking/reasoning (not separate model IDs).
+   * Different models use different param names:
+   *   - GPT: { id: "reasoning", value: "medium" }
+   *   - Claude: { id: "thinking", value: "true" } + { id: "effort", value: "high" }
+   *   - Composer: only has { id: "fast", value: "true/false" }
+   *
+   * This method finds the thinking/reasoning param and updates its value.
+   */
+  async setThinkingOption(thinkingOptionId: string | null): Promise<void> {
+    if (!thinkingOptionId || !this.currentModelSelection) {
+      return;
+    }
+
+    const params = this.currentModelSelection.params ?? [];
+
+    // Find the thinking/reasoning param (different models use different names)
+    const thinkingParamIndex = params.findIndex(
+      (p) => p.id === "thinking" || p.id === "reasoning" || p.id === "effort",
+    );
+
+    if (thinkingParamIndex >= 0) {
+      // Update existing param
+      params[thinkingParamIndex] = { ...params[thinkingParamIndex], value: thinkingOptionId };
+    } else {
+      // No existing thinking param — try to determine which param name to use
+      // based on model ID naming convention
+      const modelId = this.currentModelSelection.id;
+      const paramId = modelId.includes("claude") || modelId.includes("sonnet") || modelId.includes("opus") || modelId.includes("haiku")
+        ? "effort"  // Claude models use 'effort'
+        : "reasoning"; // GPT/Codex models use 'reasoning'
+      params.push({ id: paramId, value: thinkingOptionId });
+    }
+
+    this.currentModelSelection = { ...this.currentModelSelection, params };
+    this.config.thinkingOptionId = thinkingOptionId;
   }
 }
 
