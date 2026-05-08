@@ -404,7 +404,9 @@ export class CursorSdkAgentSession implements AgentSession {
    * Current model + params selection. Updated by setModel() and setThinkingOption().
    * Passed to agent.send() on every turn.
    */
-  private currentModelSelection: { id: string; params?: Array<{ id: string; value: string }> } | undefined;
+  private currentModelSelection:
+    | { id: string; params?: Array<{ id: string; value: string }> }
+    | undefined;
 
   get id(): string | null {
     return this.sdkAgent.agentId ?? null;
@@ -971,6 +973,7 @@ export class CursorSdkAgentClient implements AgentClient {
         cwd: config.cwd,
         // Load project hooks (.cursor/hooks.json) and user MCP config
         settingSources: ["project", "user"],
+        sandboxOptions: { enabled: false },
       },
       ...(config.mcpServers ? { mcpServers: config.mcpServers } : {}),
     });
@@ -1005,7 +1008,7 @@ export class CursorSdkAgentClient implements AgentClient {
     const sdkAgent = await Agent.resume(agentId, {
       apiKey: this.apiKey,
       ...(resolvedModel ? { model: resolvedModel } : {}),
-      local: { cwd, settingSources: ["project", "user"] },
+      local: { cwd, settingSources: ["project", "user"], sandboxOptions: { enabled: false } },
       ...(mergedConfig.mcpServers ? { mcpServers: mergedConfig.mcpServers } : {}),
     });
 
@@ -1053,16 +1056,14 @@ export class CursorSdkAgentClient implements AgentClient {
             id: v.value,
             label: v.displayName ?? v.value,
           }));
-          defaultThinkingOptionId =
-            defaultVariant?.params.find((p) => p.id === "effort")?.value;
+          defaultThinkingOptionId = defaultVariant?.params.find((p) => p.id === "effort")?.value;
         } else if (reasoningParam) {
           // GPT-style: reasoning level.
           thinkingOptions = reasoningParam.values.map((v) => ({
             id: v.value,
             label: v.displayName ?? v.value,
           }));
-          defaultThinkingOptionId =
-            defaultVariant?.params.find((p) => p.id === "reasoning")?.value;
+          defaultThinkingOptionId = defaultVariant?.params.find((p) => p.id === "reasoning")?.value;
         } else if (thinkingBoolParam) {
           // Simple on/off toggle (haiku, grok, etc.).
           thinkingOptions = [
