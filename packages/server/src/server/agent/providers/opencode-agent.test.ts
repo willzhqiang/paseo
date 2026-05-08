@@ -554,4 +554,105 @@ describe("OpenCode adapter context-window normalization", () => {
       },
     ]);
   });
+
+  test("treats primary and all OpenCode agents as selectable modes", () => {
+    expect(__openCodeInternals.isSelectableOpenCodeAgent({ mode: "primary" })).toBe(true);
+    expect(__openCodeInternals.isSelectableOpenCodeAgent({ mode: "all" })).toBe(true);
+    expect(__openCodeInternals.isSelectableOpenCodeAgent({ mode: "subagent" })).toBe(false);
+    expect(__openCodeInternals.isSelectableOpenCodeAgent({ mode: "all", hidden: true })).toBe(
+      false,
+    );
+  });
+});
+
+describe("OpenCode adapter startTurn error handling", () => {
+  test("deletes provider session on close when persistence is disabled", async () => {
+    const fakeClient = {
+      session: {
+        abort: vi.fn().mockResolvedValue({ error: null }),
+        update: vi.fn().mockResolvedValue({ error: null }),
+        delete: vi.fn().mockResolvedValue({ error: null }),
+      },
+    } as never;
+
+    const session = new __openCodeInternals.OpenCodeAgentSession(
+      { provider: "opencode", cwd: "/tmp/test" },
+      fakeClient,
+      "ses_unit_test",
+      createTestLogger(),
+      new Map(),
+      undefined,
+      false,
+    );
+
+    await session.close();
+
+    expect(fakeClient.session.delete).toHaveBeenCalledWith({
+      sessionID: "ses_unit_test",
+      directory: "/tmp/test",
+    });
+  });
+
+  test("does not delete provider session on close by default", async () => {
+    const fakeClient = {
+      session: {
+        abort: vi.fn().mockResolvedValue({ error: null }),
+        update: vi.fn().mockResolvedValue({ error: null }),
+        delete: vi.fn().mockResolvedValue({ error: null }),
+      },
+    } as never;
+
+    const session = new __openCodeInternals.OpenCodeAgentSession(
+      { provider: "opencode", cwd: "/tmp/test" },
+      fakeClient,
+      "ses_unit_test",
+      createTestLogger(),
+    );
+
+    await session.close();
+
+    expect(fakeClient.session.delete).not.toHaveBeenCalled();
+  });
+
+  test("emits turn_failed when client.session.promptAsync throws synchronously", async () => {
+    // Async iterable that never yields and never resolves. The IIFE in
+    // startTurn synchronously hits the promptAsync throw and finishes the
+    // turn before this iterator is ever pulled, so the never-resolving
+    // promise inside next() is fine and gets garbage-collected.
+    const neverYieldingStream: AsyncIterable<OpenCodeEvent> = {
+      [Symbol.asyncIterator]: () => ({
+        next: () => new Promise(() => {}),
+      }),
+    };
+
+    const fakeClient = {
+      event: {
+        subscribe: vi.fn().mockResolvedValue({ stream: neverYieldingStream }),
+      },
+      session: {
+        promptAsync: vi.fn(() => {
+          throw new Error("boom: synchronous throw");
+        }),
+      },
+    } as never;
+
+    const session = new __openCodeInternals.OpenCodeAgentSession(
+      { provider: "opencode", cwd: "/tmp/test" },
+      fakeClient,
+      "ses_unit_test",
+      createTestLogger(),
+    );
+
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+
+    await session.startTurn("hello");
+
+    const failed = events.find((event) => event.type === "turn_failed");
+    expect(failed).toBeDefined();
+    expect(failed?.type).toBe("turn_failed");
+    if (failed?.type === "turn_failed") {
+      expect(failed.error).toContain("boom: synchronous throw");
+    }
+  });
 });

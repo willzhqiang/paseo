@@ -1,4 +1,5 @@
-import { access, mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 import type { AppReleaseChannel } from "../features/auto-updater.js";
@@ -58,10 +59,17 @@ function coerceBoolean(value: unknown): boolean | null {
   return typeof value === "boolean" ? value : null;
 }
 
+function isNodeError(error: unknown): error is NodeJS.ErrnoException {
+  return error instanceof Error;
+}
+
 function buildDefaultDocument(): PersistedDesktopSettingsDocument {
   return {
     version: 1,
-    settings: DEFAULT_DESKTOP_SETTINGS,
+    settings: {
+      releaseChannel: DEFAULT_DESKTOP_SETTINGS.releaseChannel,
+      daemon: { ...DEFAULT_DESKTOP_SETTINGS.daemon },
+    },
     migrations: {
       legacyRendererSettingsImported: false,
     },
@@ -159,6 +167,10 @@ function mergeDesktopSettings(
   };
 }
 
+function hasLegacyRendererOwnedPatch(patch: DesktopSettingsPatch): boolean {
+  return patch.releaseChannel !== undefined || patch.daemon?.manageBuiltInDaemon !== undefined;
+}
+
 function coerceDocument(input: unknown): PersistedDesktopSettingsDocument {
   if (!isRecord(input)) {
     return buildDefaultDocument();
@@ -187,13 +199,19 @@ export function createDesktopSettingsStore({
 }): DesktopSettingsStore {
   const filePath = path.join(userDataPath, DESKTOP_SETTINGS_FILENAME);
   let cachedDocument: PersistedDesktopSettingsDocument | null = null;
+  let persistQueue: Promise<void> = Promise.resolve();
 
   async function persistDocument(document: PersistedDesktopSettingsDocument): Promise<void> {
-    await mkdir(userDataPath, { recursive: true });
-    const tempFilePath = `${filePath}.tmp`;
-    await writeFile(tempFilePath, `${JSON.stringify(document, null, 2)}\n`, "utf8");
-    await rename(tempFilePath, filePath);
-    cachedDocument = document;
+    const write = async () => {
+      await mkdir(userDataPath, { recursive: true });
+      const tempFilePath = `${filePath}.tmp.${process.pid}.${randomUUID()}`;
+      await writeFile(tempFilePath, `${JSON.stringify(document, null, 2)}\n`, "utf8");
+      await rename(tempFilePath, filePath);
+      cachedDocument = document;
+    };
+    const queued = persistQueue.then(write, write);
+    persistQueue = queued.catch(() => undefined);
+    await queued;
   }
 
   async function loadDocument(): Promise<PersistedDesktopSettingsDocument> {
@@ -201,19 +219,31 @@ export function createDesktopSettingsStore({
       return cachedDocument;
     }
 
+    let raw: string;
     try {
-      await access(filePath);
-    } catch {
+      raw = await readFile(filePath, "utf8");
+    } catch (error) {
+      if (!isNodeError(error) || error.code !== "ENOENT") {
+        throw error;
+      }
       const document = buildDefaultDocument();
       await persistDocument(document);
       return document;
     }
+    const document = coerceDocument(JSON.parse(raw));
+    cachedDocument = document;
+    return document;
+  }
 
+  async function loadWritableDocument(): Promise<PersistedDesktopSettingsDocument> {
+    const document = await loadDocument();
+    await persistDocument(document);
+    return document;
+  }
+
+  async function initializeLegacyRendererMigration(): Promise<PersistedDesktopSettingsDocument> {
     try {
-      const raw = await readFile(filePath, "utf8");
-      const document = coerceDocument(JSON.parse(raw));
-      await persistDocument(document);
-      return document;
+      return await loadDocument();
     } catch {
       const document = buildDefaultDocument();
       await persistDocument(document);
@@ -228,17 +258,24 @@ export function createDesktopSettingsStore({
     },
 
     async patch(patch: unknown): Promise<DesktopSettings> {
-      const current = await loadDocument();
-      const next = mergeDesktopSettings(current.settings, coerceDesktopSettingsPatch(patch));
+      const current = await loadWritableDocument();
+      const coercedPatch = coerceDesktopSettingsPatch(patch);
+      const next = mergeDesktopSettings(current.settings, coercedPatch);
       await persistDocument({
         ...current,
         settings: next,
+        migrations: {
+          ...current.migrations,
+          legacyRendererSettingsImported:
+            current.migrations.legacyRendererSettingsImported ||
+            hasLegacyRendererOwnedPatch(coercedPatch),
+        },
       });
       return next;
     },
 
     async migrateLegacyRendererSettings(legacySettings: unknown): Promise<DesktopSettings> {
-      const current = await loadDocument();
+      const current = await initializeLegacyRendererMigration();
       if (current.migrations.legacyRendererSettingsImported) {
         return current.settings;
       }

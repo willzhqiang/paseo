@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   resolveStartupRedirectRoute,
+  resolveStartupWorkspaceSelection,
   startHostRuntimeBootstrap,
   WELCOME_ROUTE,
 } from "./host-runtime-bootstrap";
@@ -53,6 +54,42 @@ describe("startHostRuntimeBootstrap", () => {
 
     expect(store.boot).toHaveBeenCalledTimes(1);
     expect(daemonStartService.start).not.toHaveBeenCalled();
+  });
+
+  it("skips daemon-start when the startup gate resolves false", async () => {
+    const store = createFakeStore();
+    const daemonStartService = createFakeDaemonStartService();
+
+    startHostRuntimeBootstrap({
+      store,
+      daemonStartService,
+      shouldStartDaemon: async () => false,
+    });
+    await Promise.resolve();
+
+    expect(store.boot).toHaveBeenCalledTimes(1);
+    expect(daemonStartService.start).not.toHaveBeenCalled();
+  });
+
+  it("surfaces gate rejection to onGateError without starting the daemon", async () => {
+    const store = createFakeStore();
+    const daemonStartService = createFakeDaemonStartService();
+    const onGateError = vi.fn();
+
+    startHostRuntimeBootstrap({
+      store,
+      daemonStartService,
+      shouldStartDaemon: async () => {
+        throw new Error("settings file unreadable");
+      },
+      onGateError,
+    });
+    await vi.waitFor(() => {
+      expect(onGateError).toHaveBeenCalledTimes(1);
+    });
+
+    expect(daemonStartService.start).not.toHaveBeenCalled();
+    expect(onGateError).toHaveBeenCalledWith(expect.stringContaining("settings file unreadable"));
   });
 
   it("does not await the daemon-start promise", () => {
@@ -114,14 +151,24 @@ describe("resolveStartupRedirectRoute", () => {
   });
 
   describe("scenario: saved-host-online", () => {
-    it("redirects to the workspace route when the online host matches the persisted workspace", () => {
+    it("leaves matching persisted workspace navigation to the workspace navigator", () => {
       const route = resolveStartupRedirectRoute({
         ...baseInput,
         anyOnlineHostServerId: "server-1",
         workspaceSelection: { serverId: "server-1", workspaceId: "workspace-a" },
       });
 
-      expect(route).toBe("/h/server-1/workspace/workspace-a");
+      expect(route).toBeNull();
+    });
+
+    it("resolves the persisted workspace when the online host matches it", () => {
+      const selection = resolveStartupWorkspaceSelection({
+        ...baseInput,
+        anyOnlineHostServerId: "server-1",
+        workspaceSelection: { serverId: "server-1", workspaceId: "workspace-a" },
+      });
+
+      expect(selection).toEqual({ serverId: "server-1", workspaceId: "workspace-a" });
     });
 
     it("redirects to the host root when the persisted workspace targets a different server", () => {
@@ -156,14 +203,14 @@ describe("resolveStartupRedirectRoute", () => {
   });
 
   describe("scenario: both-succeed", () => {
-    it("redirects to the host that the host runtime selects as earliest online", () => {
+    it("leaves matching persisted workspace navigation to the workspace navigator", () => {
       const route = resolveStartupRedirectRoute({
         ...baseInput,
         anyOnlineHostServerId: "server-saved",
         workspaceSelection: { serverId: "server-saved", workspaceId: "workspace-a" },
       });
 
-      expect(route).toBe("/h/server-saved/workspace/workspace-a");
+      expect(route).toBeNull();
     });
   });
 

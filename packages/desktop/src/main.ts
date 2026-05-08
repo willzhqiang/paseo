@@ -1,20 +1,18 @@
+process.emitWarning = (() => {}) as typeof process.emitWarning;
+
 import log from "electron-log/main";
 log.transports.console.level = "info";
 log.initialize({ spyRendererConsole: true });
 
 import { inheritLoginShellEnv } from "./login-shell-env.js";
-inheritLoginShellEnv();
 
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { existsSync } from "node:fs";
 import { execFileSync } from "node:child_process";
-import { app, BrowserWindow, ipcMain, nativeImage, net, protocol } from "electron";
+import { app, BrowserWindow, Menu, ipcMain, nativeImage, net, protocol, session } from "electron";
 import { createDaemonCommandHandlers, registerDaemonManager } from "./daemon/daemon-manager.js";
-import {
-  parseCliPassthroughArgsFromArgv,
-  runCliPassthroughCommand,
-} from "./daemon/runtime-paths.js";
+import { parsePassthroughCliArgsFromArgv, runPassthroughCli } from "./daemon/cli/passthrough.js";
 import { closeAllTransportSessions } from "./daemon/local-transport.js";
 import {
   registerWindowManager,
@@ -33,6 +31,13 @@ import {
 } from "./features/notifications.js";
 import { registerOpenerHandlers } from "./features/opener.js";
 import { setupApplicationMenu } from "./features/menu.js";
+import {
+  getPaseoBrowserIdForWebContents,
+  getPaseoBrowserWebContents,
+  listRegisteredPaseoBrowserIds,
+  registerPaseoBrowserWebContents,
+  setWorkspaceActivePaseoBrowserId,
+} from "./features/browser-webviews.js";
 import { parseOpenProjectPathFromArgv } from "./open-project-routing.js";
 import { getDesktopSettingsStore } from "./settings/desktop-settings-electron.js";
 import {
@@ -43,13 +48,138 @@ import {
   createBeforeQuitHandler,
   stopDesktopManagedDaemonOnQuitIfNeeded,
 } from "./daemon/quit-lifecycle.js";
+import { runDesktopStartup } from "./desktop-startup.js";
 
 const DEV_SERVER_URL = process.env.EXPO_DEV_URL ?? "http://localhost:8081";
 const APP_SCHEME = "paseo";
+const PASEO_DEBUG = process.env.PASEO_DEBUG === "1";
+
+function isAllowedBrowserWebviewUrl(value: string | undefined): boolean {
+  if (!value) {
+    return true;
+  }
+  try {
+    const parsed = new URL(value);
+    return (
+      parsed.protocol === "http:" || parsed.protocol === "https:" || parsed.href === "about:blank"
+    );
+  } catch {
+    return false;
+  }
+}
+
+function preventUnsafeBrowserWebviewNavigation(
+  event: Electron.Event,
+  url: string | undefined,
+): void {
+  if (!isAllowedBrowserWebviewUrl(url)) {
+    event.preventDefault();
+  }
+}
 const OPEN_PROJECT_EVENT = "paseo:event:open-project";
+const BROWSER_SHORTCUT_EVENT = "paseo:event:browser-shortcut";
+const BROWSER_FORWARDED_KEY_EVENT = "paseo:event:browser-forwarded-key";
+
+const FORWARDED_PASEO_SHORTCUT_KEYS = new Set([
+  "b",
+  "e",
+  "w",
+  "t",
+  "k",
+  "/",
+  "\\",
+  ",",
+  ".",
+  "1",
+  "2",
+  "3",
+  "4",
+  "5",
+  "6",
+  "7",
+  "8",
+  "9",
+  "enter",
+  "arrowleft",
+  "arrowright",
+  "arrowup",
+  "arrowdown",
+]);
 const DESKTOP_SMOKE_ENV = "PASEO_DESKTOP_SMOKE";
 const DESKTOP_SMOKE_STOP_REQUEST = "paseo-smoke-stop";
 app.setName("Paseo");
+
+function getBrowserIdFromWebviewPartition(partition: string | undefined): string | null {
+  const prefix = "persist:paseo-browser-";
+  if (!partition?.startsWith(prefix)) {
+    return null;
+  }
+  const browserId = partition.slice(prefix.length).trim();
+  return browserId.length > 0 ? browserId : null;
+}
+
+const pendingBrowserWebviewIds: string[] = [];
+
+function isBrowserRefreshInput(input: Electron.Input): boolean {
+  if (input.type !== "keyDown" || input.alt || input.shift) {
+    return false;
+  }
+  return (input.meta || input.control) && input.key.toLowerCase() === "r";
+}
+
+function isBrowserLocationInput(input: Electron.Input): boolean {
+  if (input.type !== "keyDown" || input.alt || input.shift) {
+    return false;
+  }
+  return (input.meta || input.control) && input.key.toLowerCase() === "l";
+}
+
+function isForwardablePaseoShortcutInput(input: Electron.Input): boolean {
+  if (input.type !== "keyDown") {
+    return false;
+  }
+  if (!input.meta && !input.control) {
+    return false;
+  }
+  return FORWARDED_PASEO_SHORTCUT_KEYS.has(input.key.toLowerCase());
+}
+
+function showBrowserWebviewContextMenu(
+  win: BrowserWindow,
+  contents: Electron.WebContents,
+  params: Electron.ContextMenuParams,
+): void {
+  const menu = Menu.buildFromTemplate([
+    { role: "copy", enabled: params.selectionText.length > 0 },
+    { role: "paste" },
+    { type: "separator" },
+    { role: "selectAll" },
+    ...(app.isPackaged
+      ? []
+      : [
+          { type: "separator" as const },
+          {
+            label: "Inspect Element",
+            click: () => {
+              log.info("[browser-devtools] inspect-element.request", {
+                webContentsId: contents.id,
+                browserId: getPaseoBrowserIdForWebContents(contents),
+                x: params.x,
+                y: params.y,
+                isDevToolsOpened: contents.isDevToolsOpened(),
+              });
+              contents.openDevTools({ mode: "detach" });
+              contents.inspectElement(params.x, params.y);
+              log.info("[browser-devtools] inspect-element.done", {
+                webContentsId: contents.id,
+                isDevToolsOpened: contents.isDevToolsOpened(),
+              });
+            },
+          },
+        ]),
+  ]);
+  menu.popup({ window: win });
+}
 
 // In dev mode, detect git worktrees and isolate each instance so multiple
 // Electron windows can run side-by-side (separate userData = separate lock).
@@ -110,9 +240,11 @@ let pendingOpenProjectPath = parseOpenProjectPathFromArgv({
   isDefaultApp: process.defaultApp,
 });
 
-log.info("[open-project] argv:", process.argv);
-log.info("[open-project] isDefaultApp:", process.defaultApp);
-log.info("[open-project] pendingOpenProjectPath:", pendingOpenProjectPath);
+if (PASEO_DEBUG) {
+  log.info("[open-project] argv:", process.argv);
+  log.info("[open-project] isDefaultApp:", process.defaultApp);
+  log.info("[open-project] pendingOpenProjectPath:", pendingOpenProjectPath);
+}
 
 // The renderer pulls the pending path on mount via IPC — this avoids
 // a race where the push event arrives before React registers its listener.
@@ -121,6 +253,59 @@ ipcMain.handle("paseo:get-pending-open-project", () => {
   const result = pendingOpenProjectPath;
   pendingOpenProjectPath = null;
   return result;
+});
+
+ipcMain.handle("paseo:browser:set-workspace-active-browser", (_event, browserId: unknown) => {
+  setWorkspaceActivePaseoBrowserId(typeof browserId === "string" ? browserId : null);
+});
+
+ipcMain.handle("paseo:browser:open-devtools", (_event, browserId: unknown) => {
+  if (typeof browserId !== "string" || browserId.trim().length === 0) {
+    const result = {
+      ok: false,
+      reason: "invalid-browser-id",
+      browserId,
+      registeredBrowserIds: listRegisteredPaseoBrowserIds(),
+    };
+    log.warn("[browser-devtools] open-devtools.invalid", result);
+    return result;
+  }
+  const contents = getPaseoBrowserWebContents(browserId);
+  if (!contents) {
+    const result = {
+      ok: false,
+      reason: "browser-webcontents-not-found",
+      browserId,
+      registeredBrowserIds: listRegisteredPaseoBrowserIds(),
+    };
+    log.warn("[browser-devtools] open-devtools.not-found", result);
+    return result;
+  }
+  log.info("[browser-devtools] open-devtools.request", {
+    browserId,
+    webContentsId: contents.id,
+    isDestroyed: contents.isDestroyed(),
+    isDevToolsOpened: contents.isDevToolsOpened(),
+    registeredBrowserIds: listRegisteredPaseoBrowserIds(),
+  });
+  contents.openDevTools({ mode: "detach" });
+  const result = {
+    ok: true,
+    reason: "opened",
+    browserId,
+    webContentsId: contents.id,
+    isDevToolsOpened: contents.isDevToolsOpened(),
+  };
+  log.info("[browser-devtools] open-devtools.done", result);
+  return result;
+});
+
+ipcMain.handle("paseo:browser:clear-partition", async (_event, browserId: unknown) => {
+  if (typeof browserId !== "string" || browserId.trim().length === 0) {
+    return;
+  }
+  const partition = `persist:paseo-browser-${browserId}`;
+  await session.fromPartition(partition).clearStorageData();
 });
 
 protocol.registerSchemesAsPrivileged([
@@ -205,6 +390,7 @@ async function createMainWindow(): Promise<void> {
       preload: getPreloadPath(),
       contextIsolation: true,
       nodeIntegration: false,
+      webviewTag: true,
     },
   });
 
@@ -216,6 +402,91 @@ async function createMainWindow(): Promise<void> {
   setupWindowResizeEvents(mainWindow);
   setupDefaultContextMenu(mainWindow);
   setupDragDropPrevention(mainWindow);
+  mainWindow.webContents.on("will-attach-webview", (event, webPreferences, params) => {
+    if (!isAllowedBrowserWebviewUrl(params.src)) {
+      event.preventDefault();
+      return;
+    }
+    const browserId = getBrowserIdFromWebviewPartition(params.partition);
+    if (!browserId) {
+      event.preventDefault();
+      return;
+    }
+    pendingBrowserWebviewIds.push(browserId);
+    webPreferences.nodeIntegration = false;
+    webPreferences.nodeIntegrationInSubFrames = false;
+    webPreferences.nodeIntegrationInWorker = false;
+    webPreferences.contextIsolation = true;
+    webPreferences.sandbox = true;
+    webPreferences.webSecurity = true;
+    webPreferences.webviewTag = false;
+    webPreferences.allowRunningInsecureContent = false;
+    delete webPreferences.preload;
+    delete params.preload;
+    delete (webPreferences as { preloadURL?: string }).preloadURL;
+    delete (params as { preloadURL?: string }).preloadURL;
+  });
+  mainWindow.webContents.on("did-attach-webview", (_event, contents) => {
+    const browserId = pendingBrowserWebviewIds.shift() ?? null;
+    if (browserId) {
+      registerPaseoBrowserWebContents(contents, browserId);
+      log.info("[browser-webview] registered", {
+        browserId,
+        webContentsId: contents.id,
+        registeredBrowserIds: listRegisteredPaseoBrowserIds(),
+      });
+    }
+    contents.on("before-input-event", (event, input) => {
+      if (isBrowserRefreshInput(input)) {
+        event.preventDefault();
+        if (contents.isLoadingMainFrame()) {
+          contents.stop();
+        } else {
+          contents.reload();
+        }
+        return;
+      }
+      if (isBrowserLocationInput(input)) {
+        event.preventDefault();
+        const focusedBrowserId = getPaseoBrowserIdForWebContents(contents);
+        mainWindow.webContents.send(BROWSER_SHORTCUT_EVENT, {
+          action: "focus-url",
+          ...(focusedBrowserId ? { browserId: focusedBrowserId } : {}),
+        });
+        return;
+      }
+      if (isForwardablePaseoShortcutInput(input)) {
+        event.preventDefault();
+        mainWindow.webContents.send(BROWSER_FORWARDED_KEY_EVENT, {
+          key: input.key,
+          code: input.code,
+          meta: input.meta,
+          control: input.control,
+          shift: input.shift,
+          alt: input.alt,
+        });
+      }
+    });
+    contents.setWindowOpenHandler(({ url }) => {
+      if (!isAllowedBrowserWebviewUrl(url)) {
+        return { action: "deny" };
+      }
+      contents.loadURL(url).catch(() => undefined);
+      return { action: "deny" };
+    });
+    contents.on("context-menu", (_contextMenuEvent, params) => {
+      showBrowserWebviewContextMenu(mainWindow, contents, params);
+    });
+    contents.on("will-navigate", (event) => {
+      preventUnsafeBrowserWebviewNavigation(event, event.url);
+    });
+    contents.on("will-frame-navigate", (event) => {
+      preventUnsafeBrowserWebviewNavigation(event, event.url);
+    });
+    contents.on("will-redirect", (event) => {
+      preventUnsafeBrowserWebviewNavigation(event, event.url);
+    });
+  });
 
   mainWindow.once("ready-to-show", () => {
     mainWindow.show();
@@ -279,18 +550,18 @@ function setupSingleInstanceLock(): boolean {
 }
 
 async function runCliPassthroughIfRequested(): Promise<boolean> {
-  const cliArgs = parseCliPassthroughArgsFromArgv(process.argv);
+  const cliArgs = parsePassthroughCliArgsFromArgv(process.argv);
   if (!cliArgs) {
     return false;
   }
 
   try {
-    const exitCode = runCliPassthroughCommand(cliArgs);
-    process.exit(exitCode);
+    const exitCode = await runPassthroughCli(cliArgs);
+    app.exit(exitCode);
   } catch (error) {
     const message = error instanceof Error ? (error.stack ?? error.message) : String(error);
     process.stderr.write(`${message}\n`);
-    process.exit(1);
+    app.exit(1);
   }
 
   return true;
@@ -344,10 +615,6 @@ function waitForDesktopSmokeStopRequest(): Promise<void> {
 }
 
 async function bootstrap(): Promise<void> {
-  if (!pendingOpenProjectPath && (await runCliPassthroughIfRequested())) {
-    return;
-  }
-
   if (!setupSingleInstanceLock()) {
     return;
   }
@@ -392,6 +659,7 @@ async function bootstrap(): Promise<void> {
   registerDialogHandlers();
   registerNotificationHandlers();
   registerOpenerHandlers();
+
   await createMainWindow();
 
   app.on("activate", async () => {
@@ -401,7 +669,12 @@ async function bootstrap(): Promise<void> {
   });
 }
 
-void bootstrap().catch((error) => {
+void runDesktopStartup({
+  hasPendingOpenProjectPath: Boolean(pendingOpenProjectPath),
+  runCliPassthroughIfRequested,
+  inheritLoginShellEnv,
+  bootstrapGui: bootstrap,
+}).catch((error) => {
   const message = error instanceof Error ? (error.stack ?? error.message) : String(error);
   process.stderr.write(`${message}\n`);
   process.exit(1);

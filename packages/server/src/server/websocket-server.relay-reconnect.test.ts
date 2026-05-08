@@ -9,12 +9,14 @@ import type { FileBackedChatService } from "./chat/chat-service.js";
 import type { LoopService } from "./loop-service.js";
 import type { ScheduleService } from "./schedule/service.js";
 import type { CheckoutDiffManager } from "./checkout-diff-manager.js";
+import { asInternals, createStub } from "./test-utils/class-mocks.js";
 import {
   asUint8Array,
   decodeTerminalStreamFrame,
   encodeTerminalStreamFrame,
   TerminalStreamOpcode,
 } from "../shared/terminal-stream-protocol.js";
+import { CLIENT_CAPS } from "../shared/client-capabilities.js";
 
 type SocketListener = (...args: unknown[]) => void;
 
@@ -47,6 +49,7 @@ const sessionMock = vi.hoisted(() => {
     cleanup = vi.fn(async () => {});
     handleMessage = vi.fn(async () => {});
     handleBinaryFrame = vi.fn((_frame: unknown) => {});
+    supports = vi.fn((capability: string) => this.args.clientCapabilities?.[capability] === true);
     getClientActivity = vi.fn(() => null);
     resetPeakInflight = vi.fn(() => {});
     getRuntimeMetrics = vi.fn(() => ({
@@ -94,6 +97,7 @@ vi.mock("./push/push-service.js", () => ({
   },
 }));
 
+import { z } from "zod";
 import { VoiceAssistantWebSocketServer } from "./websocket-server";
 import { parseServerInfoStatusPayload } from "./messages.js";
 import type { SpeechReadinessSnapshot } from "./speech/speech-runtime.js";
@@ -103,6 +107,27 @@ interface WebSocketServerInternals {
 }
 
 const TEST_DAEMON_VERSION = "1.2.3-test";
+
+const WireEnvelopeSchema = z.object({
+  type: z.string().optional(),
+  message: z
+    .object({
+      type: z.string().optional(),
+      payload: z.unknown().optional(),
+    })
+    .optional(),
+});
+
+function parseSentEnvelope(data: unknown): z.infer<typeof WireEnvelopeSchema> {
+  if (typeof data !== "string") throw new Error("Expected string frame");
+  return WireEnvelopeSchema.parse(JSON.parse(data));
+}
+
+const BinaryFrameSchema = z.object({
+  opcode: z.number(),
+  slot: z.number(),
+  payload: z.instanceof(Uint8Array),
+});
 
 class MockSocket {
   readyState = 1;
@@ -167,10 +192,10 @@ function createServer(options?: { speechReadiness?: SpeechReadinessSnapshot | nu
     onChange: vi.fn(() => () => {}),
   };
   return new VoiceAssistantWebSocketServer(
-    {} as unknown as HTTPServer,
-    createLogger() as unknown as pino.Logger,
+    createStub<HTTPServer>({}),
+    createStub<pino.Logger>(createLogger()),
     "srv_test",
-    {
+    createStub<AgentManager>({
       setAgentAttentionCallback: vi.fn(),
       getAgent: vi.fn(() => null),
       getMetricsSnapshot: vi.fn(() => ({
@@ -180,13 +205,14 @@ function createServer(options?: { speechReadiness?: SpeechReadinessSnapshot | nu
         pendingPermissionAgents: 0,
         erroredAgents: 0,
       })),
-    } as unknown as AgentManager,
-    {} as unknown as AgentStorage,
-    {} as unknown as DownloadTokenStore,
+    }),
+    createStub<AgentStorage>({}),
+    createStub<DownloadTokenStore>({}),
     "/tmp/paseo-test",
-    daemonConfigStore as unknown as DaemonConfigStore,
+    createStub<DaemonConfigStore>(daemonConfigStore),
     null,
     { allowedOrigins: new Set() },
+    undefined,
     speechReadiness
       ? {
           getReadiness: () => speechReadiness,
@@ -202,10 +228,10 @@ function createServer(options?: { speechReadiness?: SpeechReadinessSnapshot | nu
     undefined,
     undefined,
     undefined,
-    {} as unknown as FileBackedChatService,
-    {} as unknown as LoopService,
-    {} as unknown as ScheduleService,
-    {
+    createStub<FileBackedChatService>({}),
+    createStub<LoopService>({}),
+    createStub<ScheduleService>({}),
+    createStub<CheckoutDiffManager>({
       subscribe: vi.fn(),
       scheduleRefreshForCwd: vi.fn(),
       getMetrics: vi.fn(() => ({
@@ -215,7 +241,7 @@ function createServer(options?: { speechReadiness?: SpeechReadinessSnapshot | nu
         checkoutDiffFallbackRefreshTargetCount: 0,
       })),
       dispose: vi.fn(),
-    } as unknown as CheckoutDiffManager,
+    }),
   );
 }
 
@@ -292,12 +318,16 @@ function createDownloadInProgressSpeechReadinessSnapshot(): SpeechReadinessSnaps
   };
 }
 
-function createHelloMessage(clientId: string) {
+function createHelloMessage(
+  clientId: string,
+  options?: { capabilities?: Record<string, boolean> },
+) {
   return {
     type: "hello" as const,
     clientId,
     clientType: "cli" as const,
     protocolVersion: 1,
+    ...(options?.capabilities ? { capabilities: options.capabilities } : {}),
   };
 }
 
@@ -324,10 +354,7 @@ async function attachRelayAndHello(params: {
   params.socket.emit("message", JSON.stringify(createHelloMessage(params.clientId)));
   await Promise.resolve();
   expect(params.socket.sent.length).toBeGreaterThan(0);
-  const envelope = JSON.parse(params.socket.sent[0] as string) as {
-    type?: unknown;
-    message?: { type?: unknown; payload?: unknown };
-  };
+  const envelope = parseSentEnvelope(params.socket.sent[0]);
   expect(envelope.type).toBe("session");
   const serverInfo = parseServerInfoStatusPayload(envelope.message?.payload);
   expect(envelope.message?.type).toBe("status");
@@ -340,17 +367,14 @@ async function attachDirectAndHello(params: {
   socket: MockSocket;
   clientId: string;
 }) {
-  await (params.server as unknown as WebSocketServerInternals).attachSocket(
+  await asInternals<WebSocketServerInternals>(params.server).attachSocket(
     params.socket,
     createDirectRequest(),
   );
   params.socket.emit("message", JSON.stringify(createHelloMessage(params.clientId)));
   await Promise.resolve();
   expect(params.socket.sent.length).toBeGreaterThan(0);
-  const envelope = JSON.parse(params.socket.sent[0] as string) as {
-    type?: unknown;
-    message?: { type?: unknown; payload?: unknown };
-  };
+  const envelope = parseSentEnvelope(params.socket.sent[0]);
   expect(envelope.type).toBe("session");
   const serverInfo = parseServerInfoStatusPayload(envelope.message?.payload);
   expect(envelope.message?.type).toBe("status");
@@ -379,7 +403,7 @@ describe("relay external socket reconnect behavior", () => {
       clientId,
     });
     expect(sessionMock.instances).toHaveLength(1);
-    const session = sessionMock.instances[0]!;
+    const session = sessionMock.instances[0];
 
     socket1.emit("close", 1006, "");
     await vi.advanceTimersByTimeAsync(1_000);
@@ -399,6 +423,30 @@ describe("relay external socket reconnect behavior", () => {
     await server.close();
   });
 
+  test("passes hello capabilities through to the created session", async () => {
+    const server = createServer();
+    const socket = new MockSocket();
+
+    await asInternals<WebSocketServerInternals>(server).attachSocket(socket, createDirectRequest());
+    socket.emit(
+      "message",
+      JSON.stringify(
+        createHelloMessage("client-capabilities", {
+          capabilities: { [CLIENT_CAPS.reasoningMergeEnum]: true },
+        }),
+      ),
+    );
+    await Promise.resolve();
+
+    expect(sessionMock.instances).toHaveLength(1);
+    const session = sessionMock.instances[0];
+    expect(session.args.clientCapabilities).toEqual({
+      [CLIENT_CAPS.reasoningMergeEnum]: true,
+    });
+
+    await server.close();
+  });
+
   test("closes pending connection when hello timeout elapses", async () => {
     const server = createServer();
 
@@ -407,13 +455,10 @@ describe("relay external socket reconnect behavior", () => {
     let closeReason = "";
     socket.on("close", (code: unknown, reason: unknown) => {
       closeCode = typeof code === "number" ? code : null;
-      closeReason = typeof reason === "string" ? reason : String(reason ?? "");
+      closeReason = typeof reason === "string" ? reason : "";
     });
 
-    await (server as unknown as WebSocketServerInternals).attachSocket(
-      socket,
-      createDirectRequest(),
-    );
+    await asInternals<WebSocketServerInternals>(server).attachSocket(socket, createDirectRequest());
     await vi.advanceTimersByTimeAsync(15_000);
 
     expect(closeCode).toBe(4001);
@@ -475,7 +520,7 @@ describe("relay external socket reconnect behavior", () => {
     let closeReason = "";
     socket.on("close", (code: unknown, reason: unknown) => {
       closeCode = typeof code === "number" ? code : null;
-      closeReason = typeof reason === "string" ? reason : String(reason ?? "");
+      closeReason = typeof reason === "string" ? reason : "";
     });
 
     await server.attachExternalSocket(socket, { transport: "relay" });
@@ -508,7 +553,7 @@ describe("relay external socket reconnect behavior", () => {
       clientId,
     });
     expect(sessionMock.instances).toHaveLength(1);
-    const session = sessionMock.instances[0]!;
+    const session = sessionMock.instances[0];
 
     socket1.emit("close", 1006, "");
     await vi.advanceTimersByTimeAsync(1_000);
@@ -539,7 +584,7 @@ describe("relay external socket reconnect behavior", () => {
       clientId,
     });
     expect(sessionMock.instances).toHaveLength(1);
-    const session = sessionMock.instances[0]!;
+    const session = sessionMock.instances[0];
 
     const relaySocket = new MockSocket();
     await attachRelayAndHello({
@@ -549,14 +594,14 @@ describe("relay external socket reconnect behavior", () => {
     });
     expect(sessionMock.instances).toHaveLength(1);
 
-    const onMessage = session.args.onMessage as
-      | ((msg: { type: "status"; payload: { status: string } }) => void)
-      | undefined;
+    const { onMessage } = session.args;
     expect(onMessage).toBeTypeOf("function");
-    onMessage?.({
-      type: "status",
-      payload: { status: "ok" },
-    });
+    if (typeof onMessage === "function") {
+      onMessage({
+        type: "status",
+        payload: { status: "ok" },
+      });
+    }
 
     expect(directSocket.sent.length).toBeGreaterThan(0);
     expect(relaySocket.sent.length).toBeGreaterThan(0);
@@ -583,7 +628,7 @@ describe("relay external socket reconnect behavior", () => {
       clientId,
     });
     expect(sessionMock.instances).toHaveLength(1);
-    const session = sessionMock.instances[0]!;
+    const session = sessionMock.instances[0];
 
     socket1.emit("close", 1006, "");
     await vi.advanceTimersByTimeAsync(90_000);
@@ -638,9 +683,7 @@ describe("relay external socket reconnect behavior", () => {
     server.publishSpeechReadiness(speechReadiness);
     expect(socket.sent).toHaveLength(2);
 
-    const secondEnvelope = JSON.parse(socket.sent[1] as string) as {
-      message?: { payload?: unknown };
-    };
+    const secondEnvelope = parseSentEnvelope(socket.sent[1]);
     const secondPayload = parseServerInfoStatusPayload(secondEnvelope.message?.payload);
     expect(secondPayload?.capabilities?.voice?.dictation.enabled).toBe(true);
     expect(secondPayload?.capabilities?.voice?.voice.enabled).toBe(true);
@@ -665,9 +708,7 @@ describe("relay external socket reconnect behavior", () => {
     server.publishSpeechReadiness(createDownloadInProgressSpeechReadinessSnapshot());
     expect(socket.sent).toHaveLength(2);
 
-    const envelope = JSON.parse(socket.sent[1] as string) as {
-      message?: { payload?: unknown };
-    };
+    const envelope = parseSentEnvelope(socket.sent[1]);
     const payload = parseServerInfoStatusPayload(envelope.message?.payload);
     expect(payload?.capabilities?.voice?.dictation.enabled).toBe(true);
     expect(payload?.capabilities?.voice?.voice.enabled).toBe(true);
@@ -687,7 +728,7 @@ describe("relay external socket reconnect behavior", () => {
       clientId: "cid-binary-inbound",
     });
     expect(sessionMock.instances).toHaveLength(1);
-    const session = sessionMock.instances[0]!;
+    const session = sessionMock.instances[0];
 
     socket.emit(
       "message",
@@ -702,11 +743,7 @@ describe("relay external socket reconnect behavior", () => {
     await Promise.resolve();
 
     expect(session.handleBinaryFrame).toHaveBeenCalledTimes(1);
-    const frame = session.handleBinaryFrame.mock.calls[0]?.[0] as {
-      opcode: number;
-      slot: number;
-      payload: Uint8Array;
-    };
+    const frame = BinaryFrameSchema.parse(session.handleBinaryFrame.mock.calls[0]?.[0]);
     expect(frame.opcode).toBe(TerminalStreamOpcode.Input);
     expect(frame.slot).toBe(9);
     expect(new TextDecoder().decode(frame.payload)).toBe("ls\r");
@@ -724,14 +761,13 @@ describe("relay external socket reconnect behavior", () => {
       clientId: "cid-binary-outbound",
     });
     expect(sessionMock.instances).toHaveLength(1);
-    const session = sessionMock.instances[0]!;
+    const session = sessionMock.instances[0];
 
-    const onBinaryMessage = session.args.onBinaryMessage as
-      | ((frame: Uint8Array) => void)
-      | undefined;
+    const { onBinaryMessage } = session.args;
     expect(onBinaryMessage).toBeTypeOf("function");
-
-    onBinaryMessage?.(new Uint8Array([TerminalStreamOpcode.Output, 12, 0x6f, 0x6b]));
+    if (typeof onBinaryMessage === "function") {
+      onBinaryMessage(new Uint8Array([TerminalStreamOpcode.Output, 12, 0x6f, 0x6b]));
+    }
 
     expect(socket.sent).toHaveLength(2);
     const binaryPayload = asUint8Array(socket.sent[1]);

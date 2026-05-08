@@ -228,8 +228,7 @@ export function ComboboxItem({
   const itemPressableStyle = useCallback(
     ({ pressed, hovered = false }: PressableStateCallbackType & { hovered?: boolean }) => [
       styles.comboboxItem,
-      Boolean(hovered) &&
-        (elevated ? styles.comboboxItemHoveredElevated : styles.comboboxItemHovered),
+      hovered && (elevated ? styles.comboboxItemHoveredElevated : styles.comboboxItemHovered),
       pressed && (elevated ? styles.comboboxItemPressedElevated : styles.comboboxItemPressed),
       active && styles.comboboxItemActive,
       disabled && styles.comboboxItemDisabled,
@@ -488,7 +487,7 @@ function handleDesktopEnterKey(input: DesktopKeyHandlerInput) {
   if (input.orderedVisibleOptions.length === 0) return;
   const { activeIndex, orderedVisibleOptions } = input;
   const index = activeIndex >= 0 && activeIndex < orderedVisibleOptions.length ? activeIndex : 0;
-  input.handleSelect(orderedVisibleOptions[index]!.id);
+  input.handleSelect(orderedVisibleOptions[index].id);
 }
 
 interface FloatingSizeSetters {
@@ -910,10 +909,13 @@ function resolveInitialActiveIndex(
   return selectedIndex >= 0 ? selectedIndex : fallbackIndex;
 }
 
+type BottomSheetVisibility = ReturnType<typeof useIsolatedBottomSheetVisibility>;
+
 interface MobileBodyProps {
-  bottomSheetRef: ReturnType<typeof useIsolatedBottomSheetVisibility>["sheetRef"];
+  bottomSheetRef: BottomSheetVisibility["sheetRef"];
   snapPoints: string[];
-  handleSheetChange: ReturnType<typeof useIsolatedBottomSheetVisibility>["handleSheetChange"];
+  handleSheetChange: BottomSheetVisibility["handleSheetChange"];
+  handleSheetDismiss: BottomSheetVisibility["handleSheetDismiss"];
   handleIndicatorStyle: { backgroundColor: string };
   titleColor: string;
   title: string;
@@ -971,6 +973,7 @@ function MobileComboboxBody(props: MobileBodyProps): ReactElement {
       index={0}
       enableDynamicSizing={false}
       onChange={props.handleSheetChange}
+      onDismiss={props.handleSheetDismiss}
       backdropComponent={renderBackdrop}
       enablePanDownToClose
       backgroundComponent={ComboboxSheetBackground}
@@ -1298,7 +1301,11 @@ export function Combobox({
     referenceWidth,
   });
 
-  const { sheetRef: bottomSheetRef, handleSheetChange } = useIsolatedBottomSheetVisibility({
+  const {
+    sheetRef: bottomSheetRef,
+    handleSheetChange,
+    handleSheetDismiss,
+  } = useIsolatedBottomSheetVisibility({
     visible: isOpen,
     isEnabled: isMobile,
     onClose: handleClose,
@@ -1454,6 +1461,7 @@ export function Combobox({
         bottomSheetRef={bottomSheetRef}
         snapPoints={snapPoints}
         handleSheetChange={handleSheetChange}
+        handleSheetDismiss={handleSheetDismiss}
         handleIndicatorStyle={handleIndicatorStyle}
         titleColor={titleColor}
         title={title}

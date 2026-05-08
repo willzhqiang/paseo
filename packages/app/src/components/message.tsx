@@ -64,6 +64,7 @@ import { createMarkdownStyles } from "@/styles/markdown-styles";
 import { Fonts } from "@/constants/theme";
 import * as Clipboard from "expo-clipboard";
 import type { TodoEntry, UserMessageImageAttachment } from "@/types/stream";
+import type { AgentAttachment } from "@server/shared/messages";
 import type { ToolCallDetail } from "@server/server/agent/agent-sdk-types";
 import { buildToolCallDisplayModel } from "@/utils/tool-call-display";
 import { resolveToolCallIcon } from "@/utils/tool-call-icon";
@@ -97,7 +98,7 @@ import { PlanCard } from "./plan-card";
 import { useToolCallSheet } from "./tool-call-sheet";
 import { ToolCallDetailsContent } from "./tool-call-details";
 import { useAttachmentPreviewUrl } from "@/attachments/use-attachment-preview-url";
-import { persistAttachmentFromBase64, persistAttachmentFromDataUrl } from "@/attachments/service";
+import { persistAttachmentFromBytes, persistAttachmentFromDataUrl } from "@/attachments/service";
 import type { DaemonClient } from "@server/client/daemon-client";
 import { isWeb, isNative } from "@/constants/platform";
 export type { InlinePathTarget } from "@/utils/inline-path";
@@ -107,6 +108,7 @@ type MarkdownStyles = Record<string, TextStyle & ViewStyle & { [key: string]: un
 interface UserMessageProps {
   message: string;
   images?: UserMessageImageAttachment[];
+  attachments?: AgentAttachment[];
   timestamp: number;
   isFirstInGroup?: boolean;
   isLastInGroup?: boolean;
@@ -157,7 +159,9 @@ interface MarkdownWithStableRendererProps {
 
 const MarkdownWithStableRenderer = Markdown as ComponentType<MarkdownWithStableRendererProps>;
 const ThemedMarkdown = withUnistyles(MarkdownWithStableRenderer);
-const markdownStyleMapping = (theme: Theme) => ({ style: createMarkdownStyles(theme) }) as never;
+const markdownStyleMapping = (theme: Theme): Partial<MarkdownWithStableRendererProps> => ({
+  style: createMarkdownStyles(theme),
+});
 
 const ThemedMicVocal = withUnistyles(MicVocal);
 const ThemedTodoCheckIcon = withUnistyles(Check);
@@ -356,6 +360,11 @@ const userMessageStylesheet = StyleSheet.create((theme) => ({
     gap: theme.spacing[2],
     flexWrap: "wrap",
   },
+  attachmentPreviewContainer: {
+    flexDirection: "row",
+    gap: theme.spacing[2],
+    flexWrap: "wrap",
+  },
   imagePreviewSpacing: {
     marginBottom: theme.spacing[2],
   },
@@ -373,6 +382,19 @@ const userMessageStylesheet = StyleSheet.create((theme) => ({
     width: 48,
     height: 48,
     backgroundColor: theme.colors.surface1,
+  },
+  structuredAttachmentPill: {
+    maxWidth: 220,
+    borderRadius: theme.borderRadius.md,
+    borderWidth: 1,
+    borderColor: theme.colors.borderAccent,
+    backgroundColor: theme.colors.surface1,
+    paddingHorizontal: theme.spacing[3],
+    paddingVertical: theme.spacing[2],
+  },
+  structuredAttachmentText: {
+    color: theme.colors.foreground,
+    fontSize: theme.fontSize.sm,
   },
   copyButton: {
     alignSelf: "flex-end",
@@ -396,9 +418,27 @@ function UserMessageAttachmentThumbnail({ image }: { image: UserMessageImageAtta
   return <Image source={imageSource} style={userMessageStylesheet.imageThumbnail} />;
 }
 
+function getUserMessageAttachmentLabel(attachment: AgentAttachment): string {
+  switch (attachment.type) {
+    case "review": {
+      const count = attachment.comments.length;
+      return count === 1 ? "Review · 1 comment" : `Review · ${count} comments`;
+    }
+    case "github_pr":
+      return `PR #${attachment.number}`;
+    case "github_issue":
+      return `Issue #${attachment.number}`;
+    case "text":
+      return attachment.title ?? "Text attachment";
+    default:
+      return "";
+  }
+}
+
 export const UserMessage = memo(function UserMessage({
   message,
   images = [],
+  attachments = [],
   timestamp: _timestamp,
   isFirstInGroup = true,
   isLastInGroup = true,
@@ -410,6 +450,7 @@ export const UserMessage = memo(function UserMessage({
   const resolvedDisableOuterSpacing = useDisableOuterSpacing(disableOuterSpacing);
   const hasText = message.trim().length > 0;
   const hasImages = images.length > 0;
+  const hasAttachments = attachments.length > 0;
   const showCopyButton = hasText && (isCompact || messageHovered || copyButtonHovered);
 
   const handleHoverIn = useCallback(() => setMessageHovered(true), []);
@@ -430,6 +471,13 @@ export const UserMessage = memo(function UserMessage({
   const imagePreviewContainerStyle = useMemo(
     () => [
       userMessageStylesheet.imagePreviewContainer,
+      hasText || hasAttachments ? userMessageStylesheet.imagePreviewSpacing : undefined,
+    ],
+    [hasAttachments, hasText],
+  );
+  const attachmentPreviewContainerStyle = useMemo(
+    () => [
+      userMessageStylesheet.attachmentPreviewContainer,
       hasText ? userMessageStylesheet.imagePreviewSpacing : undefined,
     ],
     [hasText],
@@ -457,6 +505,20 @@ export const UserMessage = memo(function UserMessage({
               {images.map((image) => (
                 <View key={image.id} style={userMessageStylesheet.imagePill}>
                   <UserMessageAttachmentThumbnail image={image} />
+                </View>
+              ))}
+            </View>
+          ) : null}
+          {hasAttachments ? (
+            <View style={attachmentPreviewContainerStyle}>
+              {attachments.map((attachment, index) => (
+                <View
+                  key={`${attachment.type}:${"number" in attachment ? attachment.number : index}`}
+                  style={userMessageStylesheet.structuredAttachmentPill}
+                >
+                  <Text style={userMessageStylesheet.structuredAttachmentText} numberOfLines={1}>
+                    {getUserMessageAttachmentLabel(attachment)}
+                  </Text>
                 </View>
               ))}
             </View>
@@ -576,7 +638,7 @@ const AssistantMarkdownResolvedImage = memo(function AssistantMarkdownResolvedIm
   useEffect(() => {
     if (cachedMetadata) {
       setLoadState(getAssistantImageLoadStateFromMetadata(cachedMetadata));
-      return;
+      return () => {};
     }
 
     setLoadState({ status: "loading" });
@@ -704,25 +766,21 @@ function AssistantMarkdownImage({
         return null;
       }
 
-      const payload = await client.exploreFileSystem(resolution.cwd, resolution.path, "file");
-      if (payload.error) {
-        throw new Error(payload.error);
-      }
-      const file = payload.file;
-      if (!file || file.kind !== "image" || !file.content) {
+      const file = await client.readFile(resolution.cwd, resolution.path);
+      if (file.kind !== "image") {
         throw new Error("Image preview unavailable.");
       }
 
-      return await persistAttachmentFromBase64({
+      return await persistAttachmentFromBytes({
         id: createPreviewAttachmentId({
-          mimeType: file.mimeType ?? "image/png",
+          mimeType: file.mime,
           path: file.path || resolution.path,
           size: file.size,
           modifiedAt: file.modifiedAt,
-          contentLength: file.content.length,
+          contentLength: file.bytes.byteLength,
         }),
-        base64: file.content,
-        mimeType: file.mimeType,
+        bytes: file.bytes,
+        mimeType: file.mime,
         fileName: getFileNameFromPath(file.path || resolution.path),
       });
     },
@@ -870,11 +928,11 @@ function getInlineCodeAutoLinkUrl(
     return null;
   }
 
-  const matches = markdownParser.linkify.match(trimmed) as Array<{
+  const matches: Array<{
     index: number;
     lastIndex: number;
     url: string;
-  }> | null;
+  }> | null = markdownParser.linkify.match(trimmed);
   if (!matches || matches.length !== 1) {
     return null;
   }
@@ -896,7 +954,7 @@ function nodeHasParentType(parent: unknown, type: string): boolean {
     typeof parent === "object" &&
     parent !== null &&
     "type" in parent &&
-    (parent as { type?: string }).type === type
+    (parent as Record<"type", unknown>)["type"] === type
   );
 }
 
@@ -1584,16 +1642,13 @@ export const AssistantMessage = memo(function AssistantMessage({
           style={styles.link}
           onPress={handleLinkPress}
         >
-          {Children.map(children, (child) =>
-            isValidElement(child)
-              ? cloneElement(child, {
-                  style: [
-                    (child.props as { style?: StyleProp<TextStyle> }).style,
-                    { color: styles.link.color as string | undefined },
-                  ],
-                } as Partial<{ style: StyleProp<TextStyle> }>)
-              : child,
-          )}
+          {Children.map(children, (child) => {
+            if (!isValidElement(child)) return child;
+            const childProps = child.props as { style?: StyleProp<TextStyle> };
+            return cloneElement(child, {
+              style: [childProps.style, { color: styles.link.color }],
+            } as Partial<{ style: StyleProp<TextStyle> }>);
+          })}
         </MarkdownLink>
       ),
       image: (
@@ -1686,8 +1741,8 @@ const speakMessageStylesheet = StyleSheet.create((theme) => ({
   },
   headerLabel: {
     fontFamily: Fonts.sans,
-    fontSize: 12,
-    fontWeight: "500",
+    fontSize: theme.fontSize.base,
+    fontWeight: theme.fontWeight.normal,
     color: theme.colors.foregroundMuted,
   },
   text: {
@@ -1715,7 +1770,7 @@ export const SpeakMessage = memo(function SpeakMessage({
   return (
     <View testID="speak-message" style={containerStyle}>
       <View style={speakMessageStylesheet.header}>
-        <ThemedMicVocal size={14} uniProps={foregroundMutedColorMapping} />
+        <ThemedMicVocal size={12} uniProps={foregroundMutedColorMapping} />
         <Text style={speakMessageStylesheet.headerLabel}>Spoke</Text>
       </View>
       <Text style={speakMessageStylesheet.text}>{message}</Text>
@@ -1756,9 +1811,7 @@ const activityLogStylesheet = StyleSheet.create((theme) => ({
   successBg: {
     backgroundColor: "rgba(20, 83, 45, 0.3)",
   },
-  errorBg: {
-    backgroundColor: "rgba(127, 29, 29, 0.3)",
-  },
+  errorBg: {},
   artifactBg: {
     backgroundColor: "rgba(30, 58, 138, 0.4)",
   },
@@ -1773,6 +1826,8 @@ const activityLogStylesheet = StyleSheet.create((theme) => ({
   },
   iconContainer: {
     flexShrink: 0,
+    height: 20,
+    justifyContent: "center",
   },
   textContainer: {
     flex: 1,
@@ -1882,7 +1937,9 @@ export const ActivityLog = memo(function ActivityLog({
             <IconComponent size={16} color={config.color} />
           </View>
           <View style={activityLogStylesheet.textContainer}>
-            <Text style={messageTextStyle}>{displayMessage}</Text>
+            <Text style={messageTextStyle} selectable>
+              {displayMessage}
+            </Text>
             {metadata && (
               <View style={activityLogStylesheet.detailsRow}>
                 <Text style={activityLogStylesheet.detailsText}>Details</Text>
@@ -2365,12 +2422,13 @@ function useDetailWheelPropagationBlocker(input: {
   const { detailWrapperRef, enabled } = input;
   useEffect(() => {
     if (!enabled) {
-      return;
+      return () => {};
     }
-    const node = detailWrapperRef.current as unknown as HTMLElement | null;
-    if (!node || typeof node.addEventListener !== "function") {
-      return;
+    const rawRef: unknown = detailWrapperRef.current;
+    if (!(rawRef instanceof HTMLElement)) {
+      return () => {};
     }
+    const node = rawRef;
     const stopWheelPropagation = (event: WheelEvent) => {
       if (shouldStopDetailWheelPropagation(node, event)) {
         event.stopPropagation();
@@ -2540,7 +2598,7 @@ const ExpandableBadge = memo(function ExpandableBadge({
     enabled: !isNative && isExpanded && hasDetailContent,
   });
 
-  const shimmerLabelStyle = useMemo(
+  const shimmerLabelStyle = useMemo<StyleProp<TextStyle>>(
     () =>
       buildShimmerTextStyle({
         isWebShimmer,
@@ -2549,7 +2607,7 @@ const ExpandableBadge = memo(function ExpandableBadge({
         webShimmerTrackStart,
         webShimmerTrackEnd,
         offsetX: labelOffsetX,
-      }) as never,
+      }),
     [
       isWebShimmer,
       webShimmerPeakWidth,
@@ -2560,7 +2618,7 @@ const ExpandableBadge = memo(function ExpandableBadge({
     ],
   );
 
-  const shimmerSecondaryStyle = useMemo(
+  const shimmerSecondaryStyle = useMemo<StyleProp<TextStyle>>(
     () =>
       buildShimmerTextStyle({
         isWebShimmer,
@@ -2569,7 +2627,7 @@ const ExpandableBadge = memo(function ExpandableBadge({
         webShimmerTrackStart,
         webShimmerTrackEnd,
         offsetX: secondaryOffsetX,
-      }) as never,
+      }),
     [
       isWebShimmer,
       webShimmerPeakWidth,
@@ -2751,9 +2809,9 @@ function areExpandableBadgePropsEqual(previous: ExpandableBadgeProps, next: Expa
 
 interface ToolCallProps {
   toolName: string;
-  args?: unknown | null;
-  result?: unknown | null;
-  error?: unknown | null;
+  args?: unknown;
+  result?: unknown;
+  error?: unknown;
   status: "executing" | "running" | "completed" | "failed" | "canceled";
   detail?: ToolCallDetail;
   cwd?: string;
@@ -2892,7 +2950,7 @@ export const ToolCall = memo(function ToolCall({
 
   useEffect(() => {
     if (!onInlineDetailsExpandedChange) {
-      return;
+      return () => {};
     }
     return () => {
       onInlineDetailsExpandedChange(false);
@@ -2917,6 +2975,7 @@ export const ToolCall = memo(function ToolCall({
       <PlanCard
         title="Plan"
         text={effectiveDetail.text}
+        testID="timeline-plan-card"
         disableOuterSpacing={disableOuterSpacing}
       />
     );

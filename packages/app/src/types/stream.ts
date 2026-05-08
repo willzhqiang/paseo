@@ -1,5 +1,5 @@
 import type { AgentProvider, ToolCallDetail } from "@server/server/agent/agent-sdk-types";
-import type { AgentStreamEventPayload } from "@server/shared/messages";
+import type { AgentAttachment, AgentStreamEventPayload } from "@server/shared/messages";
 import type { AttachmentMetadata } from "@/attachments/types";
 import { extractTaskEntriesFromToolCall } from "../utils/tool-call-parsers";
 import { splitMarkdownBlocks } from "@/utils/split-markdown-blocks";
@@ -60,6 +60,7 @@ export interface UserMessageItem {
   text: string;
   timestamp: Date;
   images?: UserMessageImageAttachment[];
+  attachments?: AgentAttachment[];
 }
 
 export interface AssistantMessageItem {
@@ -98,7 +99,7 @@ export interface AgentToolCallData {
   callId: string;
   name: string;
   status: AgentToolCallStatus;
-  error: unknown | null;
+  error: unknown;
   detail: ToolCallDetail;
   metadata?: Record<string, unknown>;
 }
@@ -330,7 +331,7 @@ function hasNonEmptyObject(value: unknown): boolean {
   return isRecord(value) && Object.keys(value).length > 0;
 }
 
-function mergeUnknownValue(existing: unknown | null, incoming: unknown | null): unknown | null {
+function mergeUnknownValue(existing: unknown, incoming: unknown): unknown {
   if (incoming === null) {
     return existing;
   }
@@ -405,7 +406,7 @@ export function mergeToolCallDetail(
   return incoming;
 }
 
-function inputFromUnknownDetail(detail: ToolCallDetail): unknown | null {
+function inputFromUnknownDetail(detail: ToolCallDetail): unknown {
   return detail.type === "unknown" ? detail.input : null;
 }
 
@@ -513,7 +514,7 @@ function appendTodoList(
 ): StreamItem[] {
   const normalizedItems = items.map((item) => ({
     text: item.text,
-    completed: Boolean(item.completed),
+    completed: item.completed,
   }));
 
   const lastItem = state[state.length - 1];
@@ -540,10 +541,6 @@ function appendTodoList(
   };
 
   return [...state, entry];
-}
-
-function formatErrorMessage(message: string): string {
-  return `Agent error\n${message}`;
 }
 
 function reduceTimelineToolCall(
@@ -661,7 +658,7 @@ function reduceTimelineEvent(
       }
       const items: TodoEntry[] = (item.items ?? []).map((todo) => ({
         text: todo.text,
-        completed: Boolean(todo.completed),
+        completed: todo.completed,
       }));
       return finalizeActiveThoughts(appendTodoList(state, event.provider, items, timestamp));
     }
@@ -671,7 +668,7 @@ function reduceTimelineEvent(
         id: createTimelineId("error", item.message ?? "", timestamp),
         timestamp,
         activityType: "error",
-        message: formatErrorMessage(item.message ?? "Unknown error"),
+        message: item.message ?? "Unknown error",
       };
       return finalizeActiveThoughts(appendActivityLog(state, activity));
     }
@@ -792,6 +789,10 @@ function createAssistantBlockId(params: { groupId: string; blockIndex: number })
   return `${params.groupId}:block:${params.blockIndex}`;
 }
 
+function getTrailingNewlineSuffix(text: string): string {
+  return /\n+$/.exec(text)?.[0] ?? "";
+}
+
 function getActiveAssistantHeadIndex(head: StreamItem[]): number {
   for (let index = head.length - 1; index >= 0; index -= 1) {
     if (head[index]?.kind === "assistant_message") {
@@ -831,7 +832,7 @@ function promoteCompletedAssistantBlocks(params: { tail: StreamItem[]; head: Str
   const blockGroupId = activeItem.blockGroupId ?? activeItem.id;
   const firstBlockIndex = activeItem.blockIndex ?? 0;
   const completedBlocks = blocks.slice(0, -1);
-  const liveBlock = blocks[blocks.length - 1] ?? "";
+  const liveBlock = `${blocks[blocks.length - 1] ?? ""}${getTrailingNewlineSuffix(activeItem.text)}`;
   const promotedItems = completedBlocks.map<AssistantMessageItem>((block, offset) => ({
     kind: "assistant_message",
     id: createAssistantBlockId({
@@ -988,6 +989,16 @@ export function applyStreamEvent(params: {
   // Check if we need to flush head before processing this event
   if (shouldFlushHead(nextHead, incomingKind)) {
     flushHead();
+  }
+
+  if (incomingKind === "assistant_message" && nextHead.length === 0) {
+    const tailAssistant = nextTail.at(-1);
+    if (tailAssistant?.kind === "assistant_message") {
+      nextTail = nextTail.slice(0, -1);
+      nextHead = [tailAssistant];
+      changedTail = true;
+      changedHead = true;
+    }
   }
 
   // For streamable kinds, apply to head

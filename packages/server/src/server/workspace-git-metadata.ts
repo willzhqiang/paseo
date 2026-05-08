@@ -1,6 +1,7 @@
 import { basename } from "path";
 import { parseGitHubRemoteUrl } from "../utils/github-remote.js";
 import { slugify } from "../utils/worktree.js";
+import { deriveProjectGroupingKey, deriveProjectGroupingName } from "./workspace-registry-model.js";
 
 export interface WorkspaceGitMetadata {
   projectKind: "git" | "directory";
@@ -24,8 +25,7 @@ export function parseGitHubRepoNameFromRemote(remoteUrl: string): string | null 
     return null;
   }
 
-  const repoName = githubRepo.split("/").pop();
-  return repoName && repoName.length > 0 ? repoName : null;
+  return githubRepo.split("/").pop() || null;
 }
 
 export function deriveProjectSlug(cwd: string, remoteUrl: string | null = null): string {
@@ -50,26 +50,34 @@ export function buildWorkspaceGitMetadataFromSnapshot(input: {
       workspaceDisplayName: input.directoryName,
       gitRemote: null,
       isWorktree: false,
-      projectSlug: deriveProjectSlug(input.cwd, null),
+      projectSlug: deriveProjectSlug(input.cwd),
       repoRoot: null,
       currentBranch: null,
       remoteUrl: null,
     };
   }
 
-  const githubRepo = input.remoteUrl ? parseGitHubRepoFromRemote(input.remoteUrl) : null;
   const isWorktree =
     input.mainRepoRoot !== null && input.repoRoot !== null && input.mainRepoRoot !== input.repoRoot;
-
+  const projectKey = deriveProjectGroupingKey({
+    cwd: input.repoRoot ?? input.cwd,
+    remoteUrl: input.remoteUrl,
+    mainRepoRoot: input.mainRepoRoot,
+  });
   /* [local/custom-display] Allow overriding project display name source.
    * PASEO_WORKSPACE_DISPLAY=path  → always use local directory name (basename of cwd)
    * PASEO_WORKSPACE_DISPLAY=repo  → use github repo name (default behavior)
    * unset                         → default (github repo name if available, else directory) */
   const displayPref = process.env.PASEO_WORKSPACE_DISPLAY?.toLowerCase();
   const useLocalPath = displayPref === "path";
-  const projectDisplayName = useLocalPath
-    ? input.directoryName
-    : (githubRepo ?? input.directoryName);
+  let projectDisplayName: string;
+  if (useLocalPath) {
+    projectDisplayName = input.directoryName;
+  } else if (projectKey.startsWith("remote:")) {
+    projectDisplayName = deriveProjectGroupingName(projectKey);
+  } else {
+    projectDisplayName = input.directoryName;
+  }
 
   return {
     projectKind: "git",

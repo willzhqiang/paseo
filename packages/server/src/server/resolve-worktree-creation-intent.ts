@@ -1,22 +1,31 @@
 import type { GitHubPullRequestCheckoutTarget, GitHubService } from "../services/github-service.js";
-import type { AgentAttachment } from "./messages.js";
-import { findGitHubPrAttachment } from "./agent/prompt-attachments.js";
 import type { WorktreeSource } from "../utils/worktree.js";
 
 export type WorktreeCreationIntent = WorktreeSource;
 
-export interface ResolveWorktreeCreationIntentInput {
-  worktreeSlug?: string;
-  refName?: string;
-  action?: "branch-off" | "checkout";
-  githubPrNumber?: number;
-  attachments?: AgentAttachment[];
-}
+export type ResolveWorktreeCreationIntentInput =
+  | {
+      worktreeSlug: string;
+      refName?: string;
+      action?: "branch-off";
+      githubPrNumber?: undefined;
+    }
+  | {
+      worktreeSlug?: string;
+      refName?: string;
+      action: "checkout";
+      githubPrNumber?: number;
+    }
+  | {
+      worktreeSlug?: string;
+      refName?: string;
+      action?: undefined;
+      githubPrNumber: number;
+    };
 
 export interface ResolveWorktreeCreationIntentDeps {
   github: GitHubService;
   resolveDefaultBranch: (repoRoot: string) => Promise<string>;
-  generateBranchName: (seed: string | undefined) => string;
 }
 
 export class MissingCheckoutTargetError extends Error {
@@ -28,36 +37,16 @@ export class MissingCheckoutTargetError extends Error {
   }
 }
 
-export class ConflictingGitHubPullRequestIntentError extends Error {
-  readonly explicitGitHubPrNumber: number;
-  readonly attachmentGitHubPrNumber: number;
-
-  constructor(params: { explicitGitHubPrNumber: number; attachmentGitHubPrNumber: number }) {
-    super(
-      `Conflicting GitHub PR intent: explicit PR #${params.explicitGitHubPrNumber} does not match attachment PR #${params.attachmentGitHubPrNumber}`,
-    );
-    this.name = "ConflictingGitHubPullRequestIntentError";
-    this.explicitGitHubPrNumber = params.explicitGitHubPrNumber;
-    this.attachmentGitHubPrNumber = params.attachmentGitHubPrNumber;
-  }
-}
-
 export async function resolveWorktreeCreationIntent(
   input: ResolveWorktreeCreationIntentInput,
   repoRoot: string,
   deps: ResolveWorktreeCreationIntentDeps,
 ): Promise<WorktreeCreationIntent> {
-  const githubPrAttachment = findGitHubPrAttachment(input.attachments);
-  assertGitHubPrIntentAgreesWithAttachment({
-    githubPrNumber: input.githubPrNumber,
-    githubPrAttachment,
-  });
-
   if (input.action === "branch-off") {
     return {
       kind: "branch-off",
       baseBranch: input.refName?.trim() || (await resolveDefaultBranch(repoRoot, deps)),
-      newBranchName: deps.generateBranchName(input.worktreeSlug),
+      branchName: input.worktreeSlug,
     };
   }
 
@@ -66,7 +55,6 @@ export async function resolveWorktreeCreationIntent(
       return resolveGitHubPrCheckoutIntent({
         refName: input.refName,
         githubPrNumber: input.githubPrNumber,
-        githubPrAttachment,
         repoRoot,
         deps,
       });
@@ -87,7 +75,6 @@ export async function resolveWorktreeCreationIntent(
     return resolveGitHubPrCheckoutIntent({
       refName: input.refName,
       githubPrNumber: input.githubPrNumber,
-      githubPrAttachment,
       repoRoot,
       deps,
     });
@@ -97,30 +84,20 @@ export async function resolveWorktreeCreationIntent(
     return {
       kind: "branch-off",
       baseBranch: input.refName.trim(),
-      newBranchName: deps.generateBranchName(input.worktreeSlug),
+      branchName: input.worktreeSlug,
     };
-  }
-
-  if (githubPrAttachment) {
-    return resolveGitHubPrCheckoutIntent({
-      githubPrNumber: githubPrAttachment.number,
-      githubPrAttachment,
-      repoRoot,
-      deps,
-    });
   }
 
   return {
     kind: "branch-off",
     baseBranch: await resolveDefaultBranch(repoRoot, deps),
-    newBranchName: deps.generateBranchName(input.worktreeSlug),
+    branchName: input.worktreeSlug,
   };
 }
 
 async function resolveGitHubPrCheckoutIntent(params: {
   refName?: string;
   githubPrNumber: number;
-  githubPrAttachment: Extract<AgentAttachment, { type: "github_pr" }> | null;
   repoRoot: string;
   deps: ResolveWorktreeCreationIntentDeps;
 }): Promise<Extract<WorktreeCreationIntent, { kind: "checkout-github-pr" }>> {
@@ -128,14 +105,13 @@ async function resolveGitHubPrCheckoutIntent(params: {
   const headRef = await resolveGitHubPrHeadRef({
     refName: params.refName,
     githubPrNumber: params.githubPrNumber,
-    githubPrAttachment: params.githubPrAttachment,
     checkoutTarget,
     repoRoot: params.repoRoot,
     deps: params.deps,
   });
   const baseRefName =
     checkoutTarget?.baseRefName?.trim() ||
-    (await resolveGitHubPrBaseRefName(params.githubPrAttachment, params.repoRoot, params.deps));
+    (await resolveDefaultBranch(params.repoRoot, params.deps));
   const localBranchName = buildGitHubPrLocalBranchName({ headRef, checkoutTarget });
   const pushRemoteUrl = checkoutTarget
     ? checkoutTarget.headRepositorySshUrl || checkoutTarget.headRepositoryUrl || undefined
@@ -176,26 +152,9 @@ async function resolveDefaultBranch(
   return baseBranch;
 }
 
-function assertGitHubPrIntentAgreesWithAttachment(params: {
-  githubPrNumber?: number;
-  githubPrAttachment: Extract<AgentAttachment, { type: "github_pr" }> | null;
-}): void {
-  if (
-    params.githubPrNumber !== undefined &&
-    params.githubPrAttachment &&
-    params.githubPrNumber !== params.githubPrAttachment.number
-  ) {
-    throw new ConflictingGitHubPullRequestIntentError({
-      explicitGitHubPrNumber: params.githubPrNumber,
-      attachmentGitHubPrNumber: params.githubPrAttachment.number,
-    });
-  }
-}
-
 async function resolveGitHubPrHeadRef(params: {
   refName?: string;
   githubPrNumber: number;
-  githubPrAttachment: Extract<AgentAttachment, { type: "github_pr" }> | null;
   checkoutTarget?: GitHubPullRequestCheckoutTarget | null;
   repoRoot: string;
   deps: ResolveWorktreeCreationIntentDeps;
@@ -207,12 +166,6 @@ async function resolveGitHubPrHeadRef(params: {
   const checkoutTargetHeadRef = params.checkoutTarget?.headRefName.trim();
   if (checkoutTargetHeadRef) {
     return checkoutTargetHeadRef;
-  }
-  if (params.githubPrAttachment) {
-    const attachmentHeadRef = params.githubPrAttachment.headRefName?.trim();
-    if (attachmentHeadRef) {
-      return attachmentHeadRef;
-    }
   }
   return params.deps.github.getPullRequestHeadRef({
     cwd: params.repoRoot,
@@ -233,12 +186,4 @@ function buildGitHubPrLocalBranchName(params: {
 function normalizeGitHubOwnerForBranch(owner: string | null): string | null {
   const normalized = owner?.trim().toLowerCase() ?? "";
   return /^[a-z0-9-]+$/.test(normalized) ? normalized : null;
-}
-
-async function resolveGitHubPrBaseRefName(
-  attachment: Extract<AgentAttachment, { type: "github_pr" }> | null,
-  repoRoot: string,
-  deps: ResolveWorktreeCreationIntentDeps,
-): Promise<string> {
-  return attachment?.baseRefName?.trim() || (await resolveDefaultBranch(repoRoot, deps));
 }

@@ -23,7 +23,7 @@ export type SplitNode = { kind: "pane"; pane: SplitPane } | { kind: "group"; gro
 
 export interface WorkspaceLayout {
   root: SplitNode;
-  focusedPaneId: string;
+  focusedPaneId: string | null;
 }
 
 interface SplitPaneInternal extends SplitPane {
@@ -398,9 +398,9 @@ function asInternalNode(node: SplitNode): SplitNodeInternal {
 
 function asInternalLayout(layout: WorkspaceLayout): {
   root: SplitNodeInternal;
-  focusedPaneId: string;
+  focusedPaneId: string | null;
 } {
-  return layout as { root: SplitNodeInternal; focusedPaneId: string };
+  return layout as { root: SplitNodeInternal; focusedPaneId: string | null };
 }
 
 function findPanePathById(
@@ -526,7 +526,7 @@ function findNearestSiblingPaneId(root: SplitNodeInternal, paneId: string): stri
 
   for (let depth = path.length - 1; depth >= 0; depth -= 1) {
     const parentPath = path.slice(0, depth);
-    const childIndex = path[depth]!;
+    const childIndex = path[depth];
     const parentNode = getNodeAtPath(root, parentPath);
     invariant(parentNode.kind === "group", "Expected parent group for pane lookup");
 
@@ -667,7 +667,7 @@ function removePaneByPath(root: SplitNodeInternal, path: number[]): SplitNodeInt
   }
 
   const parentPath = path.slice(0, -1);
-  const removeIndex = path[path.length - 1]!;
+  const removeIndex = path[path.length - 1];
   const parentNode = getNodeAtPath(root, parentPath);
   invariant(parentNode.kind === "group", "Expected parent group while removing pane");
 
@@ -676,7 +676,7 @@ function removePaneByPath(root: SplitNodeInternal, path: number[]): SplitNodeInt
 
   const nextParentNode =
     nextParentChildren.length === 1
-      ? nextParentChildren[0]!
+      ? nextParentChildren[0]
       : createGroupNode({
           id: parentNode.group.id,
           direction: parentNode.group.direction,
@@ -899,11 +899,14 @@ export function normalizeLayout(layout: unknown): WorkspaceLayout {
 
   const rawLayout = layout as WorkspaceLayout;
   const root = normalizeNode(rawLayout.root) ?? asInternalNode(createDefaultLayout().root);
-  const focusedPaneId = trimNonEmpty(rawLayout.focusedPaneId);
+  const focusedPaneId =
+    rawLayout.focusedPaneId === null ? null : trimNonEmpty(rawLayout.focusedPaneId);
   const resolvedFocusedPaneId =
-    (focusedPaneId && findPaneById(root, focusedPaneId)?.id) ??
-    collectAllPanes(root)[0]?.id ??
-    DEFAULT_PANE_ID;
+    focusedPaneId === null
+      ? null
+      : ((focusedPaneId && findPaneById(root, focusedPaneId)?.id) ??
+        collectAllPanes(root)[0]?.id ??
+        DEFAULT_PANE_ID);
 
   return {
     root,
@@ -911,7 +914,10 @@ export function normalizeLayout(layout: unknown): WorkspaceLayout {
   };
 }
 
-export function findPaneById(root: SplitNode, paneId: string): SplitPane | null {
+export function findPaneById(root: SplitNode, paneId: string | null | undefined): SplitPane | null {
+  if (!paneId) {
+    return null;
+  }
   const internalRoot = asInternalNode(root);
   if (internalRoot.kind === "pane") {
     return internalRoot.pane.id === paneId ? internalRoot.pane : null;
@@ -961,6 +967,20 @@ export function collectAllPanes(root: SplitNode): SplitPane[] {
     return [internalRoot.pane];
   }
   return internalRoot.group.children.flatMap((child) => collectAllPanes(child));
+}
+
+export function getFocusedBrowserId(layout: WorkspaceLayout | null | undefined): string | null {
+  if (!layout) {
+    return null;
+  }
+  const focusedPane = findPaneById(layout.root, layout.focusedPaneId);
+  if (!focusedPane?.focusedTabId) {
+    return null;
+  }
+  const focusedTab = collectAllTabs(layout.root).find(
+    (tab) => tab.tabId === focusedPane.focusedTabId,
+  );
+  return focusedTab?.target.kind === "browser" ? focusedTab.target.browserId : null;
 }
 
 export function createDefaultLayout(): WorkspaceLayout {
@@ -1074,10 +1094,12 @@ export function closeTabInLayout(input: CloseTabInLayoutInput): WorkspaceLayout 
   const fallbackPaneId = findNearestSiblingPaneId(internalLayout.root, pane.id);
   const nextRoot = removeTabFromTree(internalLayout.root, input.tabId) as SplitNodeInternal;
   const nextFocusedPaneId =
-    findPaneById(nextRoot, internalLayout.focusedPaneId)?.id ??
-    (fallbackPaneId && findPaneById(nextRoot, fallbackPaneId)?.id) ??
-    collectAllPanes(nextRoot)[0]?.id ??
-    DEFAULT_PANE_ID;
+    internalLayout.focusedPaneId === null
+      ? null
+      : (findPaneById(nextRoot, internalLayout.focusedPaneId)?.id ??
+        (fallbackPaneId && findPaneById(nextRoot, fallbackPaneId)?.id) ??
+        collectAllPanes(nextRoot)[0]?.id ??
+        DEFAULT_PANE_ID);
 
   return {
     root: nextRoot,
@@ -1204,7 +1226,7 @@ export function reorderFocusedPaneTabsInLayout(
   input: ReorderFocusedPaneTabsInLayoutInput,
 ): WorkspaceLayout | null {
   const layout = asInternalLayout(input.layout);
-  if (!findPaneById(layout.root, layout.focusedPaneId)) {
+  if (!layout.focusedPaneId || !findPaneById(layout.root, layout.focusedPaneId)) {
     return null;
   }
 

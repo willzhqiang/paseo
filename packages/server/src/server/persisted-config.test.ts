@@ -2,6 +2,36 @@ import { describe, expect, test } from "vitest";
 
 import { PersistedConfigSchema } from "./persisted-config.js";
 
+describe("PersistedConfigSchema daemon auth config", () => {
+  test("accepts optional daemon password hash", () => {
+    const hash = "$2b$12$OLxyuuP9uLK30Uzc4wQX0O6liuU/Q1t5P2b0Ebf36mULvpVK3DRZW";
+    const parsed = PersistedConfigSchema.parse({
+      daemon: {
+        auth: { password: hash },
+      },
+    });
+
+    expect(parsed.daemon?.auth?.password).toBe(hash);
+  });
+});
+
+describe("PersistedConfigSchema daemon relay config", () => {
+  test("accepts optional relay TLS setting", () => {
+    const parsed = PersistedConfigSchema.parse({
+      daemon: {
+        relay: {
+          enabled: true,
+          endpoint: "relay.example.com:443",
+          publicEndpoint: "public.example.com:443",
+          useTls: true,
+        },
+      },
+    });
+
+    expect(parsed.daemon?.relay?.useTls).toBe(true);
+  });
+});
+
 describe("PersistedConfigSchema agent provider runtime settings", () => {
   test("legacy append entries are skipped during migration", () => {
     const parsed = PersistedConfigSchema.parse({

@@ -68,6 +68,22 @@ terminalPerfDescribe("Terminal keystroke stress", () => {
     expect(appBaselineReport.outputFramePayloadBytes).toBeGreaterThanOrEqual(INPUT_TEXT.length);
     expect(appBaselineReport.keydownToXtermCommitMs?.count ?? 0).toBeGreaterThan(0);
 
+    const appObserveNodeBurstReport = await measureAppObservingNodeBurstEcho({
+      page,
+      harness,
+      terminalName: "app-observe-node-burst",
+    });
+    await attachJson(testInfo, "app-observe-node-burst", appObserveNodeBurstReport);
+    console.log(
+      "[terminal-stress-app-observe-node-burst]",
+      JSON.stringify(appObserveNodeBurstReport),
+    );
+
+    expect(appObserveNodeBurstReport.outputFramePayloadBytes).toBeGreaterThanOrEqual(
+      INPUT_TEXT.length,
+    );
+    expect(appObserveNodeBurstReport.xtermWriteCount).toBeGreaterThan(0);
+
     const appSmallChunksReport = await measureAppBurstEcho({
       page,
       harness,
@@ -172,6 +188,34 @@ async function measureAppBurstEcho(input: {
   }
 }
 
+async function measureAppObservingNodeBurstEcho(input: {
+  page: Page;
+  harness: TerminalE2EHarness;
+  terminalName: string;
+}) {
+  const appTerminal = await input.harness.createTerminal({ name: input.terminalName });
+  try {
+    await input.harness.openTerminal(input.page, { terminalId: appTerminal.id });
+    await input.harness.setupPrompt(input.page);
+
+    await resetTerminalKeystrokeStressProbe(input.page);
+
+    for (const char of INPUT_TEXT) {
+      input.harness.client.sendTerminalInput(appTerminal.id, {
+        type: "input",
+        data: char,
+      });
+    }
+
+    await waitForAppStressEcho(input.page, INPUT_TEXT);
+    await waitForAppProbePayload(input.page, INPUT_TEXT.length);
+
+    return readTerminalKeystrokeStressReport(input.page, INPUT_TEXT);
+  } finally {
+    await input.harness.killTerminal(appTerminal.id);
+  }
+}
+
 async function emitRapidAgentStreamUpdates(
   harness: TerminalE2EHarness,
   input: { agentId: string; count: number },
@@ -234,7 +278,7 @@ async function measureDaemonBurstEcho(
       timeoutMs: STRESS_TIMEOUT_MS,
     });
 
-    const latencies = sendTimes.map((sentAt, index) => outputTimesByByte[index]! - sentAt);
+    const latencies = sendTimes.map((sentAt, index) => outputTimesByByte[index] - sentAt);
     return {
       inputTextLength: inputText.length,
       inputFrameCount: sendTimes.length,

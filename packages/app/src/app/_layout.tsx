@@ -3,13 +3,7 @@ import { PortalProvider } from "@gorhom/portal";
 import { QueryClientProvider } from "@tanstack/react-query";
 import * as Linking from "expo-linking";
 import * as Notifications from "expo-notifications";
-import {
-  Stack,
-  useGlobalSearchParams,
-  useNavigationContainerRef,
-  usePathname,
-  useRouter,
-} from "expo-router";
+import { Stack, useGlobalSearchParams, usePathname, useRouter } from "expo-router";
 import {
   createContext,
   type ReactNode,
@@ -26,7 +20,7 @@ import { Gesture, GestureDetector, GestureHandlerRootView } from "react-native-g
 import { KeyboardProvider } from "react-native-keyboard-controller";
 import { Extrapolation, interpolate, runOnJS, useSharedValue } from "react-native-reanimated";
 import { SafeAreaProvider } from "react-native-safe-area-context";
-import { UnistylesRuntime, useUnistyles } from "react-native-unistyles";
+import { StyleSheet, UnistylesRuntime, useUnistyles } from "react-native-unistyles";
 import { CommandCenter } from "@/components/command-center";
 import { WorktreeSetupCalloutSource } from "@/components/worktree-setup-callout-source";
 import { DownloadToast } from "@/components/download-toast";
@@ -50,17 +44,18 @@ import {
 import { SidebarCalloutProvider } from "@/contexts/sidebar-callout-context";
 import { ToastProvider } from "@/contexts/toast-context";
 import { VoiceProvider } from "@/contexts/voice-context";
-import { startHostRuntimeBootstrap } from "@/app/host-runtime-bootstrap";
+import { startDaemonIfGateAllows, startHostRuntimeBootstrap } from "@/app/host-runtime-bootstrap";
 import { shouldUseDesktopDaemon } from "@/desktop/daemon/desktop-daemon";
 import { listenToDesktopEvent } from "@/desktop/electron/events";
 import { updateDesktopWindowControls } from "@/desktop/electron/window";
 import { getDesktopHost } from "@/desktop/host";
+import { loadDesktopSettings } from "@/desktop/settings/desktop-settings";
 import { RosettaCalloutSource } from "@/desktop/updates/rosetta-callout-source";
 import { UpdateCalloutSource } from "@/desktop/updates/update-callout-source";
 import { useActiveWorktreeNewAction } from "@/hooks/use-active-worktree-new-action";
-import { useColorScheme } from "@/hooks/use-color-scheme";
 import { useFaviconStatus } from "@/hooks/use-favicon-status";
 import { useKeyboardShortcuts } from "@/hooks/use-keyboard-shortcuts";
+import { useLatchedBoolean } from "@/hooks/use-latched-boolean";
 import { useOpenProject } from "@/hooks/use-open-project";
 import { useAppSettings } from "@/hooks/use-settings";
 import { useStableEvent } from "@/hooks/use-stable-event";
@@ -70,15 +65,12 @@ import { polyfillCrypto } from "@/polyfills/crypto";
 import { queryClient } from "@/query/query-client";
 import {
   getHostRuntimeStore,
+  hasConfiguredLocalDaemonOverride,
   useHostMutations,
   useHostRuntimeClient,
   useHosts,
 } from "@/runtime/host-runtime";
 import { getDaemonStartService } from "@/runtime/daemon-start-service";
-import {
-  addBrowserActiveWorkspaceLocationListener,
-  syncNavigationActiveWorkspace,
-} from "@/stores/navigation-active-workspace-store";
 import { usePanelStore } from "@/stores/panel-store";
 import { useSessionStore } from "@/stores/session-store";
 import { THEME_TO_UNISTYLES, type ThemeName } from "@/styles/theme";
@@ -312,6 +304,14 @@ function useDaemonStartIsRunning(): boolean {
 
 const STARTUP_GIVE_UP_TIMEOUT_MS = 5_000;
 
+async function shouldStartBuiltInDaemon(): Promise<boolean> {
+  if (!shouldUseDesktopDaemon()) {
+    return false;
+  }
+  const settings = await loadDesktopSettings();
+  return settings.daemon.manageBuiltInDaemon;
+}
+
 function HostRuntimeBootstrapProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     const store = getHostRuntimeStore();
@@ -319,13 +319,16 @@ function HostRuntimeBootstrapProvider({ children }: { children: ReactNode }) {
     startHostRuntimeBootstrap({
       store,
       daemonStartService,
-      shouldStartDaemon: shouldUseDesktopDaemon(),
+      shouldStartDaemon: shouldStartBuiltInDaemon,
+      onGateError: (message) => daemonStartService.recordError(message),
     });
   }, []);
 
   const anyOnlineHostServerId = useEarliestOnlineHostServerId();
   const daemonStartError = useDaemonStartLastError();
   const daemonStartIsRunning = useDaemonStartIsRunning();
+  const waitForConfiguredLocalDaemon =
+    hasConfiguredLocalDaemonOverride() && !shouldUseDesktopDaemon();
 
   const [hasGivenUpWaitingForHost, setHasGivenUpWaitingForHost] = useState(false);
   useEffect(() => {
@@ -333,6 +336,7 @@ function HostRuntimeBootstrapProvider({ children }: { children: ReactNode }) {
       anyOnlineHostServerId ||
       daemonStartError ||
       daemonStartIsRunning ||
+      waitForConfiguredLocalDaemon ||
       hasGivenUpWaitingForHost
     ) {
       return;
@@ -343,15 +347,27 @@ function HostRuntimeBootstrapProvider({ children }: { children: ReactNode }) {
     return () => {
       clearTimeout(handle);
     };
-  }, [anyOnlineHostServerId, daemonStartError, daemonStartIsRunning, hasGivenUpWaitingForHost]);
+  }, [
+    anyOnlineHostServerId,
+    daemonStartError,
+    daemonStartIsRunning,
+    waitForConfiguredLocalDaemon,
+    hasGivenUpWaitingForHost,
+  ]);
 
   const retry = useCallback(() => {
-    void getDaemonStartService({ store: getHostRuntimeStore() }).start();
+    const daemonStartService = getDaemonStartService({ store: getHostRuntimeStore() });
+    startDaemonIfGateAllows({
+      daemonStartService,
+      shouldStartDaemon: shouldStartBuiltInDaemon,
+      onGateError: (message) => daemonStartService.recordError(message),
+    });
   }, []);
 
   const splashError = !anyOnlineHostServerId ? daemonStartError : null;
-  const storeReady =
+  const isCurrentlyStoreReady =
     Boolean(anyOnlineHostServerId) || Boolean(splashError) || hasGivenUpWaitingForHost;
+  const storeReady = useLatchedBoolean(isCurrentlyStoreReady);
 
   const state = useMemo<HostRuntimeBootstrapState>(
     () => ({ splashError, retry, hasGivenUpWaitingForHost, storeReady }),
@@ -393,7 +409,6 @@ function AppContainer({
   selectedAgentId,
   chromeEnabled: chromeEnabledOverride,
 }: AppContainerProps) {
-  const { theme } = useUnistyles();
   const daemons = useHosts();
   const { settings, updateSettings } = useAppSettings();
   const toggleMobileAgentList = usePanelStore((state) => state.toggleMobileAgentList);
@@ -407,7 +422,7 @@ function AppContainer({
   const cycleTheme = useCallback(() => {
     const currentIndex = THEME_CYCLE_ORDER.indexOf(settings.theme as ThemeName);
     const nextIndex = (currentIndex + 1) % THEME_CYCLE_ORDER.length;
-    void updateSettings({ theme: THEME_CYCLE_ORDER[nextIndex]! });
+    void updateSettings({ theme: THEME_CYCLE_ORDER[nextIndex] });
   }, [settings.theme, updateSettings]);
 
   const isCompactLayout = useIsCompactFormFactor();
@@ -450,13 +465,8 @@ function AppContainer({
 
   useActiveWorktreeNewAction();
 
-  const containerStyle = useMemo(
-    () => ({ flex: 1 as const, backgroundColor: theme.colors.surface0 }),
-    [theme.colors.surface0],
-  );
-
   const content = (
-    <View style={containerStyle}>
+    <View style={layoutStyles.surfaceFill}>
       <View style={rowStyle}>
         {!isCompactLayout && chromeEnabled && !isFocusModeEnabled && (
           <LeftSidebar selectedAgentId={selectedAgentId} />
@@ -594,9 +604,6 @@ function MobileGestureWrapper({
 function ProvidersWrapper({ children }: { children: ReactNode }) {
   const { settings, isLoading: settingsLoading } = useAppSettings();
   const { upsertConnectionFromOfferUrl } = useHostMutations();
-  const systemColorScheme = useColorScheme();
-  const { theme } = useUnistyles();
-  const resolvedTheme = settings.theme === "auto" ? (systemColorScheme ?? "light") : settings.theme;
 
   // Apply theme setting on mount and when it changes
   useEffect(() => {
@@ -609,27 +616,33 @@ function ProvidersWrapper({ children }: { children: ReactNode }) {
     }
   }, [settingsLoading, settings.theme]);
 
-  useEffect(() => {
-    if (settingsLoading || isNative) {
-      return;
-    }
-
-    void updateDesktopWindowControls({
-      backgroundColor: theme.colors.surface0,
-      foregroundColor: theme.colors.foreground,
-    }).catch((error) => {
-      console.warn("[DesktopWindow] Failed to update window controls overlay", error);
-    });
-  }, [settingsLoading, resolvedTheme, theme.colors.foreground, theme.colors.surface0]);
-
   return (
     <VoiceProvider>
+      <DesktopWindowControlsSync enabled={!settingsLoading} />
       <OfferLinkListener upsertDaemonFromOfferUrl={upsertConnectionFromOfferUrl} />
       <HostSessionManager />
       <FaviconStatusSync />
       {children}
     </VoiceProvider>
   );
+}
+
+function DesktopWindowControlsSync({ enabled }: { enabled: boolean }) {
+  const { theme } = useUnistyles();
+  const surface0 = theme.colors.surface0;
+  const foreground = theme.colors.foreground;
+
+  useEffect(() => {
+    if (!enabled || isNative) return;
+    void updateDesktopWindowControls({
+      backgroundColor: surface0,
+      foregroundColor: foreground,
+    }).catch((error) => {
+      console.warn("[DesktopWindow] Failed to update window controls overlay", error);
+    });
+  }, [enabled, surface0, foreground]);
+
+  return null;
 }
 
 function OfferLinkListener({
@@ -772,7 +785,7 @@ function AppWithSidebar({ children }: { children: ReactNode }) {
     if (hosts.some((host) => host.serverId === activeServerId)) {
       return;
     }
-    router.replace(mapPathnameToServer(pathname, hosts[0]!.serverId));
+    router.replace(mapPathnameToServer(pathname, hosts[0].serverId));
   }, [activeServerId, hosts, pathname, router]);
 
   // Parse selectedAgentKey directly from pathname
@@ -850,28 +863,6 @@ function RootStack() {
   );
 }
 
-function NavigationActiveWorkspaceObserver() {
-  const navigationRef = useNavigationContainerRef();
-
-  useEffect(() => {
-    syncNavigationActiveWorkspace(navigationRef);
-    const unsubscribeBrowserLocation = addBrowserActiveWorkspaceLocationListener();
-    const unsubscribeState = navigationRef.addListener("state", () => {
-      syncNavigationActiveWorkspace(navigationRef);
-    });
-    const unsubscribeReady = navigationRef.addListener("ready" as never, () => {
-      syncNavigationActiveWorkspace(navigationRef);
-    });
-    return () => {
-      unsubscribeBrowserLocation();
-      unsubscribeState();
-      unsubscribeReady();
-    };
-  }, [navigationRef]);
-
-  return null;
-}
-
 function AppShell() {
   return (
     <SidebarAnimationProvider>
@@ -911,20 +902,22 @@ function RootProviders({ children }: { children: ReactNode }) {
 }
 
 export default function RootLayout() {
-  const { theme } = useUnistyles();
-  const gestureRootStyle = useMemo(
-    () => ({ flex: 1, backgroundColor: theme.colors.surface0 }),
-    [theme.colors.surface0],
-  );
-
   return (
-    <GestureHandlerRootView style={gestureRootStyle}>
-      <NavigationActiveWorkspaceObserver />
-      <RootProviders>
-        <RuntimeProviders>
-          <AppShell />
-        </RuntimeProviders>
-      </RootProviders>
+    <GestureHandlerRootView style={flexStyle}>
+      <View style={layoutStyles.surfaceFill}>
+        <RootProviders>
+          <RuntimeProviders>
+            <AppShell />
+          </RuntimeProviders>
+        </RootProviders>
+      </View>
     </GestureHandlerRootView>
   );
 }
+
+const layoutStyles = StyleSheet.create((theme) => ({
+  surfaceFill: {
+    flex: 1,
+    backgroundColor: theme.colors.surface0,
+  },
+}));

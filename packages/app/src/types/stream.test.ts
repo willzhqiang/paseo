@@ -42,8 +42,8 @@ function canonicalToolTimeline(params: {
   callId: string;
   name: string;
   status: CanonicalToolStatus;
-  input?: unknown | null;
-  output?: unknown | null;
+  input?: unknown;
+  output?: unknown;
   error?: unknown;
   metadata?: Record<string, unknown>;
   detail?: ToolCallDetail;
@@ -367,18 +367,6 @@ describe("stream reducer canonical tool calls", () => {
             subAgentType: "Explore",
             description: "Inspect repository structure",
             log: "[Read] README.md\n[Bash] ls",
-            actions: [
-              {
-                index: 1,
-                toolName: "Read",
-                summary: "README.md",
-              },
-              {
-                index: 2,
-                toolName: "Bash",
-                summary: "ls",
-              },
-            ],
           },
         }),
         timestamp: new Date("2025-01-01T10:12:00Z"),
@@ -406,18 +394,6 @@ describe("stream reducer canonical tool calls", () => {
       subAgentType: "Explore",
       description: "Inspect repository structure",
       log: "[Read] README.md\n[Bash] ls",
-      actions: [
-        {
-          index: 1,
-          toolName: "Read",
-          summary: "README.md",
-        },
-        {
-          index: 2,
-          toolName: "Bash",
-          summary: "ls",
-        },
-      ],
     });
 
     const display = buildToolCallDisplayModel({

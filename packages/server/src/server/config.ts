@@ -3,7 +3,12 @@ import { resolvePaseoNodeEnv } from "./paseo-env.js";
 import { z } from "zod";
 
 import type { PaseoDaemonConfig } from "./bootstrap.js";
-import { loadPersistedConfig } from "./persisted-config.js";
+import {
+  loadPersistedConfig,
+  LogFormatSchema,
+  LogLevelSchema,
+  type PersistedConfig,
+} from "./persisted-config.js";
 import type { AgentProvider } from "./agent/agent-sdk-types.js";
 import type {
   AgentProviderRuntimeSettingsMap,
@@ -11,6 +16,7 @@ import type {
 } from "./agent/provider-launch-config.js";
 import { ProviderOverrideSchema } from "./agent/provider-launch-config.js";
 import { AgentProviderSchema } from "./agent/provider-manifest.js";
+import { hashDaemonPassword } from "./auth.js";
 import { resolveSpeechConfig } from "./speech/speech-config-resolver.js";
 import { mergeHostnames, parseHostnamesEnv, type HostnamesConfig } from "./hostnames.js";
 
@@ -34,13 +40,40 @@ function parseBooleanEnv(value: string | undefined): boolean | undefined {
   return undefined;
 }
 
+function normalizeLogEnv(value: string | undefined): string | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+
+  return value.trim().toLowerCase();
+}
+
 export type CliConfigOverrides = Partial<{
   listen: string;
   relayEnabled: boolean;
+  relayUseTls: boolean;
   mcpEnabled: boolean;
   mcpInjectIntoAgents: boolean;
   hostnames: HostnamesConfig;
 }>;
+
+function resolveLogConfigFromEnv(
+  env: NodeJS.ProcessEnv,
+  persisted: ReturnType<typeof loadPersistedConfig>,
+): PersistedConfig["log"] {
+  const envLogLevel = LogLevelSchema.safeParse(normalizeLogEnv(env.PASEO_LOG_LEVEL));
+  const envLogFormat = LogFormatSchema.safeParse(normalizeLogEnv(env.PASEO_LOG_FORMAT));
+
+  if (!envLogLevel.success && !envLogFormat.success) {
+    return persisted.log;
+  }
+
+  return {
+    ...persisted.log,
+    ...(envLogLevel.success ? { level: envLogLevel.data } : {}),
+    ...(envLogFormat.success ? { format: envLogFormat.data } : {}),
+  };
+}
 
 const OptionalVoiceLlmProviderSchema = z
   .union([z.string(), z.null(), z.undefined()])
@@ -107,12 +140,14 @@ interface ResolveRelayInput {
   env: NodeJS.ProcessEnv;
   persisted: ReturnType<typeof loadPersistedConfig>;
   cliRelayEnabled: boolean | undefined;
+  cliRelayUseTls: boolean | undefined;
 }
 
 interface ResolvedRelay {
   enabled: boolean;
   endpoint: string;
   publicEndpoint: string;
+  useTls: boolean;
 }
 
 function resolveRelayConfig(input: ResolveRelayInput): ResolvedRelay {
@@ -129,7 +164,12 @@ function resolveRelayConfig(input: ResolveRelayInput): ResolvedRelay {
     input.env.PASEO_RELAY_PUBLIC_ENDPOINT ??
     input.persisted.daemon?.relay?.publicEndpoint ??
     endpoint;
-  return { enabled, endpoint, publicEndpoint };
+  const useTls =
+    input.cliRelayUseTls ??
+    (input.env.PASEO_RELAY_USE_TLS !== undefined
+      ? (parseBooleanEnv(input.env.PASEO_RELAY_USE_TLS) ?? false)
+      : (input.persisted.daemon?.relay?.useTls ?? endpoint === DEFAULT_RELAY_ENDPOINT));
+  return { enabled, endpoint, publicEndpoint, useTls };
 }
 
 interface ResolvedVoiceLlm {
@@ -184,6 +224,19 @@ function resolveListenAddress(
   );
 }
 
+function resolveAuthConfig(
+  env: NodeJS.ProcessEnv,
+  persisted: ReturnType<typeof loadPersistedConfig>,
+): PaseoDaemonConfig["auth"] {
+  const envPassword = env.PASEO_PASSWORD?.trim();
+  if (envPassword) {
+    return { password: hashDaemonPassword(envPassword) };
+  }
+  return persisted.daemon?.auth?.password
+    ? { password: persisted.daemon.auth.password }
+    : undefined;
+}
+
 function resolveStaticLoadConfigSettings(
   env: NodeJS.ProcessEnv,
   cli: CliConfigOverrides | undefined,
@@ -220,6 +273,7 @@ export function loadConfig(
     env,
     persisted,
     cliRelayEnabled: options?.cli?.relayEnabled,
+    cliRelayUseTls: options?.cli?.relayUseTls,
   });
 
   const { openai, speech } = resolveSpeechConfig({
@@ -248,7 +302,9 @@ export function loadConfig(
     relayEnabled: relay.enabled,
     relayEndpoint: relay.endpoint,
     relayPublicEndpoint: relay.publicEndpoint,
+    relayUseTls: relay.useTls,
     appBaseUrl,
+    auth: resolveAuthConfig(env, persisted),
     openai,
     speech,
     voiceLlmProvider: voiceLlm.provider,
@@ -256,5 +312,6 @@ export function loadConfig(
     voiceLlmModel: voiceLlm.model,
     agentProviderSettings: extractAgentProviderSettings(providerOverrides),
     providerOverrides,
+    log: resolveLogConfigFromEnv(env, persisted),
   };
 }

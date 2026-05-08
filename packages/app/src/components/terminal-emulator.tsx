@@ -3,6 +3,7 @@
 import {
   useCallback,
   useEffect,
+  useImperativeHandle,
   useMemo,
   useRef,
   useState,
@@ -18,6 +19,7 @@ import type { ITheme } from "@xterm/xterm";
 import type { TerminalState } from "@server/shared/messages";
 import type { PendingTerminalModifiers } from "../utils/terminal-keys";
 import { TerminalEmulatorRuntime } from "../terminal/runtime/terminal-emulator-runtime";
+import type { TerminalRendererReadyChange } from "../utils/terminal-renderer-readiness";
 import { openExternalUrl } from "../utils/open-external-url";
 import { focusWithRetries } from "../utils/web-focus";
 import {
@@ -127,6 +129,7 @@ interface TerminalEmulatorProps {
     meta: boolean;
   }) => Promise<void> | void;
   onPendingModifiersConsumed?: () => Promise<void> | void;
+  onRendererReadyChange?: (change: TerminalRendererReadyChange) => void;
   pendingModifiers?: PendingTerminalModifiers;
   focusRequestToken?: number;
   resizeRequestToken?: number;
@@ -138,6 +141,16 @@ declare global {
 
 function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
+}
+
+function isTerminalState(value: unknown): value is TerminalState {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "rows" in value &&
+    "cols" in value &&
+    "grid" in value
+  );
 }
 
 function ensureTerminalScrollbarStyle(): void {
@@ -181,6 +194,7 @@ export default function TerminalEmulator({
   onResize,
   onTerminalKey,
   onPendingModifiersConsumed,
+  onRendererReadyChange,
   pendingModifiers = { ctrl: false, shift: false, alt: false },
   focusRequestToken = 0,
   resizeRequestToken = 0,
@@ -198,6 +212,8 @@ export default function TerminalEmulator({
   const themeKey = useMemo(() => buildXtermThemeKey(xtermTheme), [xtermTheme]);
   const xtermThemeRef = useRef(xtermTheme);
   xtermThemeRef.current = xtermTheme;
+  const onRendererReadyChangeRef = useRef(onRendererReadyChange);
+  onRendererReadyChangeRef.current = onRendererReadyChange;
   const mountCallbacksRef = useRef({
     onInput,
     onResize,
@@ -224,20 +240,41 @@ export default function TerminalEmulator({
   const [isScrollVisible, setIsScrollVisible] = useState(false);
   const [isScrollActive, setIsScrollActive] = useState(false);
 
+  const domBridgeRef = useRef<DOMImperativeFactory | null>(null);
   useDOMImperativeHandle(
-    ref as Ref<DOMImperativeFactory>,
-    () =>
-      ({
-        writeOutput: (text: string) => {
-          runtimeRef.current?.write({ text });
-        },
-        renderSnapshot: (state: TerminalState | null) => {
+    domBridgeRef,
+    (): DOMImperativeFactory => ({
+      writeOutput: (...args) => {
+        const text = args[0];
+        if (typeof text === "string") runtimeRef.current?.write({ text });
+      },
+      renderSnapshot: (...args) => {
+        const state = args[0];
+        if (state === null) {
+          runtimeRef.current?.renderSnapshot({ state: null });
+        } else if (isTerminalState(state)) {
           runtimeRef.current?.renderSnapshot({ state });
-        },
-        clear: () => {
-          runtimeRef.current?.clear();
-        },
-      }) as unknown as DOMImperativeFactory,
+        }
+      },
+      clear: () => {
+        runtimeRef.current?.clear();
+      },
+    }),
+    [],
+  );
+  useImperativeHandle(
+    ref,
+    (): TerminalEmulatorHandle => ({
+      writeOutput: (text: string) => {
+        runtimeRef.current?.write({ text });
+      },
+      renderSnapshot: (state: TerminalState | null) => {
+        runtimeRef.current?.renderSnapshot({ state });
+      },
+      clear: () => {
+        runtimeRef.current?.clear();
+      },
+    }),
     [],
   );
 
@@ -254,7 +291,7 @@ export default function TerminalEmulator({
   useEffect(() => {
     const root = rootRef.current;
     if (!root || !swipeGesturesEnabled) {
-      return;
+      return () => {};
     }
 
     const SWIPE_MIN_PX = 22;
@@ -371,7 +408,7 @@ export default function TerminalEmulator({
     const host = hostRef.current;
     const root = rootRef.current;
     if (!host || !root) {
-      return;
+      return () => {};
     }
 
     const runtime = new TerminalEmulatorRuntime();
@@ -389,9 +426,11 @@ export default function TerminalEmulator({
       initialSnapshot: initialSnapshotRef.current,
       theme: mountedThemeRef.current,
     });
+    onRendererReadyChangeRef.current?.({ streamKey, isReady: true });
 
     return () => {
       runtime.unmount();
+      onRendererReadyChangeRef.current?.({ streamKey, isReady: false });
       if (runtimeRef.current === runtime) {
         runtimeRef.current = null;
       }
@@ -416,7 +455,7 @@ export default function TerminalEmulator({
 
   useEffect(() => {
     if (focusRequestToken <= 0) {
-      return;
+      return () => {};
     }
     runtimeRef.current?.resize({ force: true });
     return focusWithRetries({
@@ -444,14 +483,14 @@ export default function TerminalEmulator({
   useEffect(() => {
     const host = hostRef.current;
     if (!host) {
-      return;
+      return () => {};
     }
 
     const viewportElement = host.querySelector<HTMLElement>(".xterm-viewport");
     if (!viewportElement) {
       viewportRef.current = null;
       setViewportMetrics({ offset: 0, viewportSize: 0, contentSize: 0 });
-      return;
+      return () => {};
     }
 
     viewportRef.current = viewportElement;
@@ -559,7 +598,7 @@ export default function TerminalEmulator({
 
   useEffect(() => {
     if (!isDraggingScrollbar) {
-      return;
+      return () => {};
     }
 
     const handlePointerMove = (event: PointerEvent) => {

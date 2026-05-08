@@ -23,6 +23,7 @@ import type {
   WorkspaceDescriptorPayload,
 } from "@server/shared/messages";
 import { normalizeWorkspaceOpaqueId } from "@/utils/workspace-identity";
+import { resolveWorkspaceMapKeyByIdentity } from "@/utils/workspace-execution";
 import {
   createAgentLastActivityCoalescer,
   type AgentLastActivityCommitter,
@@ -63,9 +64,9 @@ export type MessageEntry =
       id: string;
       timestamp: number;
       toolName: string;
-      args: unknown | null;
-      result?: unknown | null;
-      error?: unknown | null;
+      args: unknown;
+      result?: unknown;
+      error?: unknown;
       status: "executing" | "completed" | "failed";
     };
 
@@ -117,6 +118,7 @@ export interface WorkspaceDescriptor {
   workspaceKind: WorkspaceDescriptorPayload["workspaceKind"];
   name: string;
   status: WorkspaceDescriptorPayload["status"];
+  archivingAt: string | null;
   diffStat: { additions: number; deletions: number } | null;
   scripts: WorkspaceDescriptorPayload["scripts"];
   gitRuntime?: WorkspaceDescriptorPayload["gitRuntime"];
@@ -128,8 +130,8 @@ export function normalizeWorkspaceDescriptor(
   payload: WorkspaceDescriptorPayload,
 ): WorkspaceDescriptor {
   return {
-    id: normalizeWorkspaceOpaqueId(String(payload.id)) ?? String(payload.id),
-    projectId: String(payload.projectId),
+    id: normalizeWorkspaceOpaqueId(payload.id) ?? payload.id,
+    projectId: payload.projectId,
     projectDisplayName: payload.projectDisplayName,
     projectRootPath: payload.projectRootPath,
     workspaceDirectory: payload.workspaceDirectory,
@@ -137,6 +139,7 @@ export function normalizeWorkspaceDescriptor(
     workspaceKind: payload.workspaceKind,
     name: payload.name,
     status: payload.status,
+    archivingAt: payload.archivingAt ?? null,
     diffStat: payload.diffStat ?? null,
     scripts: (payload.scripts ?? []).map((s) => Object.assign({}, s)),
     gitRuntime: payload.gitRuntime,
@@ -266,6 +269,8 @@ export interface SessionState {
   agentStreamTail: Map<string, StreamItem[]>;
   agentStreamHead: Map<string, StreamItem[]>;
   agentTimelineCursor: Map<string, AgentTimelineCursorState>;
+  agentTimelineHasOlder: Map<string, boolean>;
+  agentTimelineOlderFetchInFlight: Map<string, boolean>;
   historySyncGeneration: number;
   agentHistorySyncGeneration: Map<string, number>;
   agentAuthoritativeHistoryApplied: Map<string, boolean>;
@@ -348,6 +353,14 @@ interface SessionStoreActions {
     state:
       | Map<string, AgentTimelineCursorState>
       | ((prev: Map<string, AgentTimelineCursorState>) => Map<string, AgentTimelineCursorState>),
+  ) => void;
+  setAgentTimelineHasOlder: (
+    serverId: string,
+    state: Map<string, boolean> | ((prev: Map<string, boolean>) => Map<string, boolean>),
+  ) => void;
+  setAgentTimelineOlderFetchInFlight: (
+    serverId: string,
+    state: Map<string, boolean> | ((prev: Map<string, boolean>) => Map<string, boolean>),
   ) => void;
   bumpHistorySyncGeneration: (serverId: string) => void;
   markAgentHistorySynchronized: (serverId: string, agentId: string) => void;
@@ -441,6 +454,8 @@ function createInitialSessionState(serverId: string, client: DaemonClient): Sess
     agentStreamTail: new Map(),
     agentStreamHead: new Map(),
     agentTimelineCursor: new Map(),
+    agentTimelineHasOlder: new Map(),
+    agentTimelineOlderFetchInFlight: new Map(),
     historySyncGeneration: 0,
     agentHistorySyncGeneration: new Map(),
     agentAuthoritativeHistoryApplied: new Map(),
@@ -859,6 +874,48 @@ export const useSessionStore = create<SessionStore>()(
         });
       },
 
+      setAgentTimelineHasOlder: (serverId, state) => {
+        set((prev) => {
+          const session = prev.sessions[serverId];
+          if (!session) {
+            return prev;
+          }
+          const nextState =
+            typeof state === "function" ? state(session.agentTimelineHasOlder) : state;
+          if (session.agentTimelineHasOlder === nextState) {
+            return prev;
+          }
+          return {
+            ...prev,
+            sessions: {
+              ...prev.sessions,
+              [serverId]: { ...session, agentTimelineHasOlder: nextState },
+            },
+          };
+        });
+      },
+
+      setAgentTimelineOlderFetchInFlight: (serverId, state) => {
+        set((prev) => {
+          const session = prev.sessions[serverId];
+          if (!session) {
+            return prev;
+          }
+          const nextState =
+            typeof state === "function" ? state(session.agentTimelineOlderFetchInFlight) : state;
+          if (session.agentTimelineOlderFetchInFlight === nextState) {
+            return prev;
+          }
+          return {
+            ...prev,
+            sessions: {
+              ...prev.sessions,
+              [serverId]: { ...session, agentTimelineOlderFetchInFlight: nextState },
+            },
+          };
+        });
+      },
+
       bumpHistorySyncGeneration: (serverId) => {
         set((prev) => {
           const session = prev.sessions[serverId];
@@ -1058,11 +1115,15 @@ export const useSessionStore = create<SessionStore>()(
       removeWorkspace: (serverId, workspaceId) => {
         set((prev) => {
           const session = prev.sessions[serverId];
-          if (!session || !session.workspaces.has(workspaceId)) {
+          const workspaceKey = resolveWorkspaceMapKeyByIdentity({
+            workspaces: session?.workspaces,
+            workspaceId,
+          });
+          if (!session || !workspaceKey) {
             return prev;
           }
           const next = new Map(session.workspaces);
-          next.delete(workspaceId);
+          next.delete(workspaceKey);
           return {
             ...prev,
             sessions: {

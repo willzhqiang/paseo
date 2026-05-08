@@ -1,6 +1,6 @@
 import type { AgentProvider, AgentStreamEvent, AgentTimelineItem } from "./agent-sdk-types.js";
 
-export const AGENT_STREAM_COALESCE_DEFAULT_WINDOW_MS = 200;
+export const AGENT_STREAM_COALESCE_DEFAULT_WINDOW_MS = 60;
 
 type CoalescableTextKind = "assistant_message" | "reasoning";
 type CoalescableTimelineKind = CoalescableTextKind | "tool_call";
@@ -11,7 +11,7 @@ type CoalescableTimelineEvent = Extract<AgentStreamEvent, { type: "timeline" }> 
 };
 
 export interface AgentStreamCoalescerTimers {
-  setTimeout: typeof setTimeout;
+  setTimeout: (callback: () => void, ms?: number) => ReturnType<typeof setTimeout>;
   clearTimeout: typeof clearTimeout;
 }
 

@@ -9,8 +9,8 @@ import {
 } from "./agent/provider-launch-config.js";
 import type { AgentProviderRuntimeSettingsMap } from "./agent/provider-launch-config.js";
 
-const LogLevelSchema = z.enum(["trace", "debug", "info", "warn", "error", "fatal"]);
-const LogFormatSchema = z.enum(["pretty", "json"]);
+export const LogLevelSchema = z.enum(["trace", "debug", "info", "warn", "error", "fatal"]);
+export const LogFormatSchema = z.enum(["pretty", "json"]);
 
 const LogConfigSchema = z
   .object({
@@ -59,6 +59,16 @@ const ProvidersSchema = z
   .object({
     openai: ProviderCredentialsSchema.optional(),
     local: LocalSpeechProviderSchema.optional(),
+  })
+  .strict();
+
+const BcryptHashSchema = z.string().regex(/^\$2[aby]\$\d{2}\$[./A-Za-z0-9]{53}$/, {
+  message: "Expected a bcrypt hash",
+});
+
+const DaemonAuthSchema = z
+  .object({
+    password: BcryptHashSchema.optional(),
   })
   .strict();
 
@@ -248,9 +258,11 @@ export const PersistedConfigSchema = z
             enabled: z.boolean().optional(),
             endpoint: z.string().optional(),
             publicEndpoint: z.string().optional(),
+            useTls: z.boolean().optional(),
           })
           .strict()
           .optional(),
+        auth: DaemonAuthSchema.optional(),
       })
       .strict()
       .transform(({ allowedHosts, ...daemon }) => {

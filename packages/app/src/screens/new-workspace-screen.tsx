@@ -26,11 +26,12 @@ import { useDraftStore } from "@/stores/draft-store";
 import { useWorkspaceDraftSubmissionStore } from "@/stores/workspace-draft-submission-store";
 import { toErrorMessage } from "@/utils/error-messages";
 import { navigateToPreparedWorkspaceTab } from "@/utils/workspace-navigation";
-import type { ComposerAttachment } from "@/attachments/types";
+import type { ComposerAttachment, UserComposerAttachment } from "@/attachments/types";
 import type { ImageAttachment, MessagePayload } from "@/components/message-input";
 import type { AgentAttachment, GitHubSearchItem } from "@server/shared/messages";
 import type { AgentProvider } from "@server/server/agent/agent-sdk-types";
 import { pickerItemToCheckoutRequest, type PickerItem } from "./new-workspace-picker-item";
+import { syncPickerPrAttachment } from "./new-workspace-picker-state";
 
 interface NewWorkspaceScreenProps {
   serverId: string;
@@ -194,36 +195,6 @@ function pickerItemTriggerLabel(item: PickerItem): string {
   return item.kind === "branch" ? item.name : formatPrLabel(item.item);
 }
 
-function syncPickerPrAttachment(input: {
-  attachments: ComposerAttachment[];
-  previousPickerPrNumber: number | null;
-  item: PickerItem;
-}): { attachments: ComposerAttachment[]; attachedPrNumber: number | null } {
-  let nextAttachments = input.attachments;
-  let attachedPrNumber: number | null = null;
-
-  if (input.previousPickerPrNumber !== null) {
-    nextAttachments = nextAttachments.filter(
-      (attachment) =>
-        attachment.kind !== "github_pr" || attachment.item.number !== input.previousPickerPrNumber,
-    );
-  }
-
-  if (input.item.kind === "github-pr") {
-    const selectedPr = input.item.item;
-    const hasExistingPrAttachment = nextAttachments.some(
-      (attachment) =>
-        attachment.kind === "github_pr" && attachment.item.number === selectedPr.number,
-    );
-    if (!hasExistingPrAttachment) {
-      nextAttachments = [...nextAttachments, { kind: "github_pr", item: selectedPr }];
-      attachedPrNumber = selectedPr.number;
-    }
-  }
-
-  return { attachments: nextAttachments, attachedPrNumber };
-}
-
 function computePickerOptionData(
   branchDetails: ReadonlyArray<{ name: string; committerDate: number }>,
   prItems: ReadonlyArray<GitHubSearchItem>,
@@ -293,6 +264,7 @@ interface CreateChatAgentInput {
   composerState: ReturnType<typeof useAgentInputDraft>["composerState"];
   ensureWorkspace: (input: {
     cwd: string;
+    prompt: string;
     attachments: AgentAttachment[];
   }) => Promise<ReturnType<typeof normalizeWorkspaceDescriptor>>;
   serverId: string;
@@ -310,7 +282,11 @@ async function runCreateChatAgent(input: CreateChatAgentInput): Promise<void> {
     throw new Error("Select a model");
   }
   const { attachments: reviewAttachments } = splitComposerAttachmentsForSubmit(attachments);
-  const ensuredWorkspace = await ensureWorkspace({ cwd, attachments: reviewAttachments });
+  const ensuredWorkspace = await ensureWorkspace({
+    cwd,
+    prompt: text,
+    attachments: reviewAttachments,
+  });
   submitWorkspaceDraft({
     serverId,
     draftKey,
@@ -373,7 +349,9 @@ function submitWorkspaceDraft(input: SubmitDraftInput): void {
     }),
     draft: {
       text,
-      attachments,
+      attachments: attachments.filter(
+        (attachment): attachment is UserComposerAttachment => attachment.kind !== "review",
+      ),
       cwd: workspaceDirectory,
     },
   });
@@ -399,7 +377,6 @@ function submitWorkspaceDraft(input: SubmitDraftInput): void {
     serverId,
     workspaceId,
     target: { kind: "draft", draftId },
-    navigationMethod: "replace",
   });
   useDraftStore.getState().clearDraftInput({ draftKey, lifecycle: "sent" });
 }
@@ -586,13 +563,22 @@ export function NewWorkspaceScreen({
   }, []);
 
   const buildCreateWorktreeInput = useCallback(
-    (input: { cwd: string; attachments: AgentAttachment[] }) => {
+    (input: { cwd: string; prompt: string; attachments: AgentAttachment[] }) => {
       const checkoutRequest = pickerItemToCheckoutRequest(selectedItem);
+      const trimmedPrompt = input.prompt.trim();
+      const hasFirstAgentContext = trimmedPrompt.length > 0 || input.attachments.length > 0;
 
       return {
         cwd: input.cwd,
         worktreeSlug: createNameId(),
-        ...(input.attachments.length > 0 ? { attachments: input.attachments } : {}),
+        ...(hasFirstAgentContext
+          ? {
+              firstAgentContext: {
+                ...(trimmedPrompt ? { prompt: trimmedPrompt } : {}),
+                ...(input.attachments.length > 0 ? { attachments: input.attachments } : {}),
+              },
+            }
+          : {}),
         ...checkoutRequest,
       };
     },
@@ -600,7 +586,7 @@ export function NewWorkspaceScreen({
   );
 
   const ensureWorkspace = useCallback(
-    async (input: { cwd: string; attachments: AgentAttachment[] }) => {
+    async (input: { cwd: string; prompt: string; attachments: AgentAttachment[] }) => {
       if (createdWorkspace) {
         return createdWorkspace;
       }

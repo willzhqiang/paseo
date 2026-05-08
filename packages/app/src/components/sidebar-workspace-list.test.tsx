@@ -13,6 +13,18 @@ vi.hoisted(() => {
   (globalThis as unknown as { __DEV__: boolean }).__DEV__ = false;
 });
 
+const pathnameState = vi.hoisted(() => ({
+  value: "/",
+}));
+
+vi.mock("expo-router", () => ({
+  router: {
+    dismissTo: vi.fn(),
+  },
+  useLocalSearchParams: () => ({}),
+  usePathname: () => pathnameState.value,
+}));
+
 import {
   createSidebarWorkspaceEntry,
   type SidebarProjectEntry,
@@ -28,18 +40,13 @@ import type { HostProfile } from "@/types/host-connection";
 import { useSessionStore, type WorkspaceDescriptor } from "@/stores/session-store";
 import { useSidebarOrderStore } from "@/stores/sidebar-order-store";
 import { useWorkspaceFields } from "@/stores/session-store-hooks";
-import {
-  activateNavigationWorkspaceSelection,
-  syncNavigationActiveWorkspace,
-  useIsNavigationProjectActive,
-  useIsNavigationWorkspaceSelected,
-} from "@/stores/navigation-active-workspace-store";
+import { useActiveWorkspaceSelection } from "@/stores/navigation-active-workspace-store";
 
 vi.mock("@react-native-async-storage/async-storage", () => ({
   default: {
-    getItem: vi.fn(),
-    setItem: vi.fn(),
-    removeItem: vi.fn(),
+    getItem: vi.fn().mockResolvedValue(null),
+    setItem: vi.fn().mockResolvedValue(undefined),
+    removeItem: vi.fn().mockResolvedValue(undefined),
   },
 }));
 
@@ -83,6 +90,7 @@ function workspace(input: {
     workspaceKind: input.name === "main" ? "local_checkout" : "worktree",
     name: input.name,
     status: input.status ?? "done",
+    archivingAt: null,
     diffStat: null,
     scripts: input.scripts ?? [],
   };
@@ -221,10 +229,11 @@ function ProjectActiveProbe({
   project: SidebarProjectEntry;
   counts: RenderCounts;
 }): null {
-  useIsNavigationProjectActive({
-    serverId,
-    workspaceIds: project.workspaces.map((entry) => entry.workspaceId),
-  });
+  const activeSelection = useActiveWorkspaceSelection();
+  const isActive =
+    activeSelection?.serverId === serverId &&
+    project.workspaces.some((entry) => entry.workspaceId === activeSelection.workspaceId);
+  void isActive;
   incrementRecord(counts.projectSelection, project.projectKey);
   return null;
 }
@@ -238,7 +247,10 @@ function WorkspaceSelectionProbe({
   workspaceId: string;
   counts: RenderCounts;
 }): null {
-  useIsNavigationWorkspaceSelected({ serverId, workspaceId });
+  const activeSelection = useActiveWorkspaceSelection();
+  const selected =
+    activeSelection?.serverId === serverId && activeSelection.workspaceId === workspaceId;
+  void selected;
   incrementRecord(counts.rowSelection, workspaceId);
   return null;
 }
@@ -303,10 +315,14 @@ async function renderProbe(counts: RenderCounts): Promise<{ root: Root; containe
   document.body.appendChild(container);
   const root = createRoot(container);
   await act(async () => {
-    root.render(<SidebarFrameProbe counts={counts} />);
+    renderSidebarFrame(root, counts);
   });
   resetCounts(counts);
   return { root, container };
+}
+
+function renderSidebarFrame(root: Root, counts: RenderCounts) {
+  root.render(<SidebarFrameProbe counts={counts} />);
 }
 
 describe("sidebar workspace render isolation", () => {
@@ -327,7 +343,7 @@ describe("sidebar workspace render isolation", () => {
     container?.remove();
     container = null;
     act(() => {
-      syncNavigationActiveWorkspace({ current: null });
+      pathnameState.value = "/";
       getHostRuntimeStore().syncHosts([]);
       useSessionStore.getState().clearSession(SERVER_ID);
       useSidebarOrderStore.setState({
@@ -350,7 +366,7 @@ describe("sidebar workspace render isolation", () => {
     act(() => {
       useSessionStore.getState().mergeWorkspaces(SERVER_ID, [
         {
-          ...createWorkspaces()[1]!,
+          ...createWorkspaces()[1],
           status: "running",
         },
       ]);
@@ -416,7 +432,7 @@ describe("sidebar workspace render isolation", () => {
     });
   });
 
-  it("isolates active selection updates to affected row and project boolean probes", async () => {
+  it("updates active selection probes from the active workspace route", async () => {
     const counts: RenderCounts = {
       frame: 0,
       headers: {},
@@ -426,29 +442,28 @@ describe("sidebar workspace render isolation", () => {
     };
 
     act(() => {
-      activateNavigationWorkspaceSelection({
-        serverId: SERVER_ID,
-        workspaceId: "a-one",
-      });
+      pathnameState.value = `/h/${SERVER_ID}/workspace/a-one`;
     });
     ({ root, container } = await renderProbe(counts));
 
     act(() => {
-      activateNavigationWorkspaceSelection({
-        serverId: SERVER_ID,
-        workspaceId: "b-two",
-      });
+      pathnameState.value = `/h/${SERVER_ID}/workspace/b-two`;
+      if (root) {
+        renderSidebarFrame(root, counts);
+      }
     });
 
-    expect(counts.frame).toBe(0);
-    expect(counts.headers).toEqual({});
-    expect(counts.rows).toEqual({});
+    expect(counts.frame).toBe(1);
     expect(counts.projectSelection).toEqual({
       "project-a": 1,
       "project-b": 1,
     });
     expect(counts.rowSelection).toEqual({
+      "a-main": 1,
       "a-one": 1,
+      "a-two": 1,
+      "b-main": 1,
+      "b-one": 1,
       "b-two": 1,
     });
   });

@@ -87,6 +87,7 @@ function workspace(input: {
     projectKind: "git",
     workspaceKind: "local_checkout",
     name: input.id,
+    archivingAt: null,
     status: "done",
     activityAt: null,
     diffStat: null,
@@ -251,7 +252,6 @@ describe("useProjects", () => {
     });
     expect(Object.keys(result.current.projects[0] ?? {}).sort()).toEqual([
       "githubUrl",
-      "hiddenUnsupportedRemoteCount",
       "hostCount",
       "hosts",
       "onlineHostCount",

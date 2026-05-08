@@ -91,6 +91,8 @@ interface SplitContainerProps {
   onCloseOtherTabs: (tabId: string, paneTabs: WorkspaceTabDescriptor[]) => Promise<void> | void;
   onCreateDraftTab: (input: { paneId?: string }) => void;
   onCreateTerminalTab: (input: { paneId?: string }) => void;
+  onCreateBrowserTab: (input: { paneId?: string }) => void;
+  showCreateBrowserTab?: boolean;
   buildPaneContentModel: (input: {
     paneId: string;
     tab: WorkspaceTabDescriptor;
@@ -123,10 +125,30 @@ interface SplitPaneDropData {
   paneId: string;
 }
 
+function isWorkspaceTabDragData(data: unknown): data is WorkspaceTabDragData {
+  return typeof data === "object" && data !== null && Reflect.get(data, "kind") === "workspace-tab";
+}
+
+function isSplitPaneDropData(data: unknown): data is SplitPaneDropData {
+  return (
+    typeof data === "object" && data !== null && Reflect.get(data, "kind") === "split-pane-drop"
+  );
+}
+
+function asWorkspaceTabDragData(data: unknown): WorkspaceTabDragData | undefined {
+  return isWorkspaceTabDragData(data) ? data : undefined;
+}
+
+function asDragOverData(data: unknown): WorkspaceTabDragData | SplitPaneDropData | undefined {
+  if (isWorkspaceTabDragData(data)) return data;
+  if (isSplitPaneDropData(data)) return data;
+  return undefined;
+}
+
 interface SplitNodeViewProps extends Omit<SplitContainerProps, "layout" | "onMoveTabToPane"> {
   node: SplitNode;
   uiTabs: WorkspaceTab[];
-  focusedPaneId: string;
+  focusedPaneId: string | null;
   activeDragTabId: string | null;
   showDropZones: boolean;
   dropPreview: SplitDropZoneHover | null;
@@ -158,6 +180,7 @@ interface MountedTabSlotProps {
   isWorkspaceFocused: boolean;
   isPaneFocused: boolean;
   paneId: string;
+  onFocusPane: (paneId: string) => void;
   buildPaneContentModel: (input: {
     paneId: string;
     tab: WorkspaceTabDescriptor;
@@ -170,6 +193,7 @@ const MountedTabSlot = memo(function MountedTabSlot({
   isWorkspaceFocused,
   isPaneFocused,
   paneId,
+  onFocusPane,
   buildPaneContentModel,
 }: MountedTabSlotProps) {
   const content = useMemo(
@@ -181,10 +205,13 @@ const MountedTabSlot = memo(function MountedTabSlot({
     [buildPaneContentModel, paneId, tabDescriptor],
   );
 
-  const wrapperStyle = useMemo(
-    () => ({ display: (isVisible ? "flex" : "none") as "flex" | "none", flex: 1 }),
-    [isVisible],
-  );
+  const wrapperStyle = useMemo(() => {
+    const display: "flex" | "none" = isVisible ? "flex" : "none";
+    return { display, flex: 1 };
+  }, [isVisible]);
+  const handleFocusPane = useCallback(() => {
+    onFocusPane(paneId);
+  }, [onFocusPane, paneId]);
 
   return (
     <View style={wrapperStyle}>
@@ -192,6 +219,7 @@ const MountedTabSlot = memo(function MountedTabSlot({
         content={content}
         isWorkspaceFocused={isWorkspaceFocused}
         isPaneFocused={isPaneFocused}
+        onFocusPane={handleFocusPane}
       />
     </View>
   );
@@ -339,6 +367,8 @@ export function SplitContainer({
   onCloseOtherTabs,
   onCreateDraftTab,
   onCreateTerminalTab,
+  onCreateBrowserTab,
+  showCreateBrowserTab,
   buildPaneContentModel,
   onFocusPane,
   onSplitPane,
@@ -370,7 +400,7 @@ export function SplitContainer({
     if (!focusModeEnabled) {
       return layout.root;
     }
-    const focusedPane = panesById.get(layout.focusedPaneId);
+    const focusedPane = layout.focusedPaneId ? panesById.get(layout.focusedPaneId) : null;
     if (!focusedPane) {
       return layout.root;
     }
@@ -378,8 +408,8 @@ export function SplitContainer({
   }, [focusModeEnabled, layout.root, layout.focusedPaneId, panesById]);
 
   const handleDragStart = useCallback((event: DragStartEvent) => {
-    const data = event.active.data.current as WorkspaceTabDragData | undefined;
-    if (data?.kind !== "workspace-tab") {
+    const data = asWorkspaceTabDragData(event.active.data.current);
+    if (!data) {
       setActiveDragTabId(null);
       setDropPreview(null);
       setTabDropPreview(null);
@@ -396,11 +426,8 @@ export function SplitContainer({
 
   const updateDropPreview = useCallback(
     (event: Pick<DragMoveEvent, "active" | "over"> | Pick<DragOverEvent, "active" | "over">) => {
-      const activeData = event.active.data.current as WorkspaceTabDragData | undefined;
-      const overData = event.over?.data.current as
-        | WorkspaceTabDragData
-        | SplitPaneDropData
-        | undefined;
+      const activeData = asWorkspaceTabDragData(event.active.data.current);
+      const overData = asDragOverData(event.over?.data.current);
 
       if (activeData?.kind !== "workspace-tab") {
         setDropPreview(null);
@@ -503,11 +530,8 @@ export function SplitContainer({
 
   const handleDragEnd = useCallback(
     (event: DragEndEvent) => {
-      const activeData = event.active.data.current as WorkspaceTabDragData | undefined;
-      const overData = event.over?.data.current as
-        | WorkspaceTabDragData
-        | SplitPaneDropData
-        | undefined;
+      const activeData = asWorkspaceTabDragData(event.active.data.current);
+      const overData = asDragOverData(event.over?.data.current);
 
       setActiveDragTabId(null);
 
@@ -557,6 +581,8 @@ export function SplitContainer({
         onCloseOtherTabs={onCloseOtherTabs}
         onCreateDraftTab={onCreateDraftTab}
         onCreateTerminalTab={onCreateTerminalTab}
+        onCreateBrowserTab={onCreateBrowserTab}
+        showCreateBrowserTab={showCreateBrowserTab}
         buildPaneContentModel={buildPaneContentModel}
         onFocusPane={onFocusPane}
         onSplitPane={onSplitPane}
@@ -694,6 +720,8 @@ function SplitNodeView({
   onCloseOtherTabs,
   onCreateDraftTab,
   onCreateTerminalTab,
+  onCreateBrowserTab,
+  showCreateBrowserTab,
   buildPaneContentModel,
   onFocusPane,
   onSplitPane,
@@ -744,6 +772,8 @@ function SplitNodeView({
         onCloseOtherTabs={onCloseOtherTabs}
         onCreateDraftTab={onCreateDraftTab}
         onCreateTerminalTab={onCreateTerminalTab}
+        onCreateBrowserTab={onCreateBrowserTab}
+        showCreateBrowserTab={showCreateBrowserTab}
         buildPaneContentModel={buildPaneContentModel}
         onFocusPane={onFocusPane}
         onSplitPane={onSplitPane}
@@ -787,6 +817,8 @@ function SplitNodeView({
               onCloseOtherTabs={onCloseOtherTabs}
               onCreateDraftTab={onCreateDraftTab}
               onCreateTerminalTab={onCreateTerminalTab}
+              onCreateBrowserTab={onCreateBrowserTab}
+              showCreateBrowserTab={showCreateBrowserTab}
               buildPaneContentModel={buildPaneContentModel}
               onFocusPane={onFocusPane}
               onSplitPane={onSplitPane}
@@ -836,6 +868,8 @@ function SplitPaneView({
   onCloseOtherTabs,
   onCreateDraftTab,
   onCreateTerminalTab,
+  onCreateBrowserTab,
+  showCreateBrowserTab,
   buildPaneContentModel,
   onFocusPane,
   onSplitPane: _onSplitPane,
@@ -885,17 +919,14 @@ function SplitPaneView({
 
   useEffect(() => {
     if (isNative) {
-      return;
+      return () => {};
     }
 
-    const paneElement = paneRef.current as unknown as HTMLElement | null;
-    if (
-      !paneElement ||
-      typeof paneElement.addEventListener !== "function" ||
-      typeof paneElement.removeEventListener !== "function"
-    ) {
-      return;
+    const rawRef: unknown = paneRef.current;
+    if (!(rawRef instanceof HTMLElement)) {
+      return () => {};
     }
+    const paneElement = rawRef;
 
     const handlePanePointerDown = (event: PointerEvent) => {
       if (!shouldFocusPaneFromEventTarget(event.target)) {
@@ -977,6 +1008,8 @@ function SplitPaneView({
           onCloseOtherTabs={handleCloseOtherTabs}
           onCreateDraftTab={onCreateDraftTab}
           onCreateTerminalTab={onCreateTerminalTab}
+          onCreateBrowserTab={onCreateBrowserTab}
+          showCreateBrowserTab={showCreateBrowserTab}
           onReorderTabs={handleReorderTabs}
           onSplitRight={handleSplitRight}
           onSplitDown={handleSplitDown}
@@ -1004,6 +1037,7 @@ function SplitPaneView({
                   isWorkspaceFocused={isWorkspaceFocused}
                   isPaneFocused={isFocused && tabId === activeTabDescriptor?.tabId}
                   paneId={pane.id}
+                  onFocusPane={stableOnFocusPane}
                   buildPaneContentModel={buildPaneContentModel}
                 />
               );

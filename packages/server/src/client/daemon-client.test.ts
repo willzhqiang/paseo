@@ -1,5 +1,7 @@
 import { afterEach, expect, expectTypeOf, test, vi } from "vitest";
+import { z } from "zod";
 import { DaemonClient, type DaemonTransport } from "./daemon-client";
+import { encodeFileTransferFrame, FileTransferOpcode } from "../shared/binary-frames/index.js";
 import {
   asUint8Array,
   decodeTerminalResizePayload,
@@ -12,6 +14,9 @@ import {
 expectTypeOf<"getGitDiff" extends keyof DaemonClient ? true : false>().toEqualTypeOf<false>();
 expectTypeOf<
   "getHighlightedDiff" extends keyof DaemonClient ? true : false
+>().toEqualTypeOf<false>();
+expectTypeOf<
+  "exploreFileSystem" extends keyof DaemonClient ? true : false
 >().toEqualTypeOf<false>();
 
 function createMockLogger() {
@@ -56,10 +61,12 @@ function createMockTransport() {
   return {
     transport,
     sent,
-    triggerOpen: () => {
+    triggerOpen: (options?: { preserveSent?: boolean }) => {
       onOpen();
-      // Ignore HELLO handshake payloads in assertions.
-      sent.length = 0;
+      if (!options?.preserveSent) {
+        // Ignore HELLO handshake payloads in assertions.
+        sent.length = 0;
+      }
       onMessage(
         JSON.stringify({
           type: "session",
@@ -86,6 +93,22 @@ function wrapSessionMessage(message: unknown): string {
     type: "session",
     message,
   });
+}
+
+function assertStr(data: string | Uint8Array | ArrayBuffer | undefined): string {
+  if (typeof data !== "string") throw new Error("Expected string frame");
+  return data;
+}
+
+function parseSentFrame(
+  data: string | Uint8Array | ArrayBuffer | undefined,
+): Record<string, unknown> {
+  return z
+    .object({
+      type: z.literal("session"),
+      message: z.record(z.unknown()),
+    })
+    .parse(JSON.parse(assertStr(data))).message;
 }
 
 const clients: DaemonClient[] = [];
@@ -117,10 +140,7 @@ test("dedupes in-flight checkout status requests per agentId", async () => {
 
   expect(mock.sent).toHaveLength(1);
 
-  const request = JSON.parse(mock.sent[0]) as {
-    type: "session";
-    message: { type: "checkout_status_request"; cwd: string; requestId: string };
-  };
+  const request = parseSentFrame(mock.sent[0]);
 
   const response = {
     type: "session",
@@ -129,7 +149,7 @@ test("dedupes in-flight checkout status requests per agentId", async () => {
       payload: {
         cwd: "/tmp/project",
         error: null,
-        requestId: request.message.requestId,
+        requestId: request.requestId,
         isGit: false,
         isPaseoOwnedWorktree: false,
         repoRoot: null,
@@ -149,12 +169,12 @@ test("dedupes in-flight checkout status requests per agentId", async () => {
   const [r1, r2] = await Promise.all([p1, p2]);
   expect(r1).toMatchObject({
     cwd: "/tmp/project",
-    requestId: request.message.requestId,
+    requestId: request.requestId,
     isGit: false,
   });
   expect(r2).toMatchObject({
     cwd: "/tmp/project",
-    requestId: request.message.requestId,
+    requestId: request.requestId,
     isGit: false,
   });
 
@@ -162,25 +182,77 @@ test("dedupes in-flight checkout status requests per agentId", async () => {
   const p3 = client.getCheckoutStatus("/tmp/project");
   expect(mock.sent).toHaveLength(2);
 
-  const request2 = JSON.parse(mock.sent[1]) as {
-    type: "session";
-    message: { type: "checkout_status_request"; cwd: string; requestId: string };
-  };
+  const request2 = parseSentFrame(mock.sent[1]);
 
   mock.triggerMessage(
     JSON.stringify({
       ...response,
       message: {
         ...response.message,
-        payload: { ...response.message.payload, requestId: request2.message.requestId },
+        payload: { ...response.message.payload, requestId: request2.requestId },
       },
     }),
   );
 
   await expect(p3).resolves.toMatchObject({
     cwd: "/tmp/project",
-    requestId: request2.message.requestId,
+    requestId: request2.requestId,
     isGit: false,
+  });
+});
+
+test("passes password as HTTP bearer header and WebSocket subprotocol", async () => {
+  const logger = createMockLogger();
+  const mock = createMockTransport();
+  const transportFactory = vi.fn(() => mock.transport);
+
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "clsk_unit_test",
+    password: "shared-secret",
+    logger,
+    reconnect: { enabled: false },
+    transportFactory,
+  });
+  clients.push(client);
+
+  const connectPromise = client.connect();
+  mock.triggerOpen();
+  await connectPromise;
+
+  expect(transportFactory).toHaveBeenCalledWith({
+    url: "ws://test",
+    headers: { Authorization: "Bearer shared-secret" },
+    protocols: ["paseo.bearer.shared-secret"],
+  });
+});
+
+test("advertises reasoning_merge_enum in hello", async () => {
+  const logger = createMockLogger();
+  const mock = createMockTransport();
+
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "clsk_unit_test",
+    logger,
+    reconnect: { enabled: false },
+    transportFactory: () => mock.transport,
+  });
+  clients.push(client);
+
+  const connectPromise = client.connect();
+  mock.triggerOpen({ preserveSent: true });
+  await connectPromise;
+
+  expect(mock.sent).toHaveLength(1);
+  expect(JSON.parse(assertStr(mock.sent[0]))).toEqual({
+    type: "hello",
+    clientId: "clsk_unit_test",
+    clientType: "cli",
+    protocolVersion: 1,
+    capabilities: {
+      reasoning_merge_enum: true,
+    },
   });
 });
 
@@ -207,6 +279,209 @@ test("does not reconnect after close when ensureConnected is called", async () =
 
   client.ensureConnected();
   expect(client.getConnectionState().status).toBe("disposed");
+});
+
+test("listDirectory sends a list file explorer request and returns directory entries", async () => {
+  const logger = createMockLogger();
+  const mock = createMockTransport();
+
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "clsk_unit_test",
+    logger,
+    reconnect: { enabled: false },
+    transportFactory: () => mock.transport,
+  });
+  clients.push(client);
+
+  const connectPromise = client.connect();
+  mock.triggerOpen();
+  await connectPromise;
+
+  const responsePromise = client.listDirectory("/tmp/project", "src", "req-list");
+
+  expect(JSON.parse(assertStr(mock.sent[0]))).toEqual({
+    type: "session",
+    message: {
+      type: "file_explorer_request",
+      cwd: "/tmp/project",
+      path: "src",
+      mode: "list",
+      requestId: "req-list",
+    },
+  });
+
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "file_explorer_response",
+      payload: {
+        cwd: "/tmp/project",
+        path: "src",
+        mode: "list",
+        directory: {
+          path: "src",
+          entries: [
+            {
+              name: "index.ts",
+              path: "src/index.ts",
+              kind: "file",
+              size: 12,
+              modifiedAt: "2026-05-02T00:00:00.000Z",
+            },
+          ],
+        },
+        file: null,
+        error: null,
+        requestId: "req-list",
+      },
+    }),
+  );
+
+  await expect(responsePromise).resolves.toEqual({
+    path: "src",
+    entries: [
+      {
+        name: "index.ts",
+        path: "src/index.ts",
+        kind: "file",
+        size: 12,
+        modifiedAt: "2026-05-02T00:00:00.000Z",
+      },
+    ],
+  });
+});
+
+test("readFile hides legacy base64 behind bytes", async () => {
+  const logger = createMockLogger();
+  const mock = createMockTransport();
+
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "clsk_unit_test",
+    logger,
+    reconnect: { enabled: false },
+    transportFactory: () => mock.transport,
+  });
+  clients.push(client);
+
+  const connectPromise = client.connect();
+  mock.triggerOpen();
+  await connectPromise;
+
+  const responsePromise = client.readFile("/tmp/project", "logo.png", "req-file");
+
+  expect(JSON.parse(assertStr(mock.sent[0]))).toEqual({
+    type: "session",
+    message: {
+      type: "file_explorer_request",
+      cwd: "/tmp/project",
+      path: "logo.png",
+      mode: "file",
+      acceptBinary: true,
+      requestId: "req-file",
+    },
+  });
+
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "file_explorer_response",
+      payload: {
+        cwd: "/tmp/project",
+        path: "logo.png",
+        mode: "file",
+        directory: null,
+        file: {
+          path: "logo.png",
+          kind: "image",
+          encoding: "base64",
+          content: "aGVsbG8=",
+          mimeType: "image/png",
+          size: 5,
+          modifiedAt: "2026-05-02T00:00:00.000Z",
+        },
+        error: null,
+        requestId: "req-file",
+      },
+    }),
+  );
+
+  const result = await responsePromise;
+  expect(result).toMatchObject({
+    mime: "image/png",
+    size: 5,
+    path: "logo.png",
+    kind: "image",
+    modifiedAt: "2026-05-02T00:00:00.000Z",
+  });
+  expect(new TextDecoder().decode(result.bytes)).toBe("hello");
+});
+
+test("readFile resolves from binary file frames when the daemon supports them", async () => {
+  const logger = createMockLogger();
+  const mock = createMockTransport();
+
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "clsk_unit_test",
+    logger,
+    reconnect: { enabled: false },
+    transportFactory: () => mock.transport,
+  });
+  clients.push(client);
+
+  const connectPromise = client.connect();
+  mock.triggerOpen();
+  await connectPromise;
+
+  const responsePromise = client.readFile("/tmp/project", "logo.png", "req-binary");
+
+  expect(JSON.parse(assertStr(mock.sent[0]))).toEqual({
+    type: "session",
+    message: {
+      type: "file_explorer_request",
+      cwd: "/tmp/project",
+      path: "logo.png",
+      mode: "file",
+      acceptBinary: true,
+      requestId: "req-binary",
+    },
+  });
+
+  mock.triggerMessage(
+    encodeFileTransferFrame({
+      opcode: FileTransferOpcode.FileBegin,
+      requestId: "req-binary",
+      metadata: {
+        mime: "image/png",
+        size: 5,
+        encoding: "binary",
+        modifiedAt: "2026-05-02T00:00:00.000Z",
+      },
+    }),
+  );
+  mock.triggerMessage(
+    encodeFileTransferFrame({
+      opcode: FileTransferOpcode.FileChunk,
+      requestId: "req-binary",
+      payload: new TextEncoder().encode("hello"),
+    }),
+  );
+  mock.triggerMessage(
+    encodeFileTransferFrame({
+      opcode: FileTransferOpcode.FileEnd,
+      requestId: "req-binary",
+    }),
+  );
+
+  const result = await responsePromise;
+  expect(result).toMatchObject({
+    mime: "image/png",
+    size: 5,
+    path: "logo.png",
+    kind: "image",
+    modifiedAt: "2026-05-02T00:00:00.000Z",
+  });
+  expect(new TextDecoder().decode(result.bytes)).toBe("hello");
 });
 
 test("normalizes workspace_setup_progress into a workspace-scoped daemon event", async () => {
@@ -311,15 +586,8 @@ test("sends create_agent_request with string workspace ids", async () => {
   });
 
   expect(mock.sent).toHaveLength(1);
-  const request = JSON.parse(String(mock.sent[0])) as {
-    type: "session";
-    message: {
-      type: "create_agent_request";
-      requestId: string;
-      workspaceId: string;
-    };
-  };
-  expect(request.message).toEqual(
+  const request = parseSentFrame(mock.sent[0]);
+  expect(request).toEqual(
     expect.objectContaining({
       type: "create_agent_request",
       workspaceId: "ws-feature-a",
@@ -331,7 +599,7 @@ test("sends create_agent_request with string workspace ids", async () => {
       type: "status",
       payload: {
         status: "agent_create_failed",
-        requestId: request.message.requestId,
+        requestId: request.requestId,
         error: "compat test sentinel",
       },
     }),
@@ -375,15 +643,8 @@ test("sends structured attachments with create_agent_request", async () => {
   });
 
   expect(mock.sent).toHaveLength(1);
-  const request = JSON.parse(String(mock.sent[0])) as {
-    type: "session";
-    message: {
-      type: "create_agent_request";
-      requestId: string;
-      attachments: Array<{ type: string; mimeType: string; number: number }>;
-    };
-  };
-  expect(request.message.attachments).toEqual([
+  const request = parseSentFrame(mock.sent[0]);
+  expect(request.attachments).toEqual([
     {
       type: "github_pr",
       mimeType: "application/github-pr",
@@ -400,7 +661,7 @@ test("sends structured attachments with create_agent_request", async () => {
       type: "status",
       payload: {
         status: "agent_create_failed",
-        requestId: request.message.requestId,
+        requestId: request.requestId,
         error: "attachment test sentinel",
       },
     }),
@@ -440,21 +701,8 @@ test("sends worktree base-ref fields in create_agent_request git options", async
   });
 
   expect(mock.sent).toHaveLength(1);
-  const request = JSON.parse(String(mock.sent[0])) as {
-    type: "session";
-    message: {
-      type: "create_agent_request";
-      requestId: string;
-      git: {
-        createWorktree: boolean;
-        worktreeSlug: string;
-        refName: string;
-        action: string;
-        githubPrNumber: number;
-      };
-    };
-  };
-  expect(request.message.git).toEqual({
+  const request = parseSentFrame(mock.sent[0]);
+  expect(request.git).toEqual({
     createWorktree: true,
     worktreeSlug: "review-pr-123",
     refName: "feature/worktree-base-ref",
@@ -467,7 +715,7 @@ test("sends worktree base-ref fields in create_agent_request git options", async
       type: "status",
       payload: {
         status: "agent_create_failed",
-        requestId: request.message.requestId,
+        requestId: request.requestId,
         error: "git ref fields sentinel",
       },
     }),
@@ -503,7 +751,7 @@ test("omitting create_agent_request worktree base-ref fields preserves legacy wi
     },
   });
 
-  expect(String(mock.sent[0])).toBe(
+  expect(assertStr(mock.sent[0])).toBe(
     JSON.stringify({
       type: "session",
       message: {
@@ -536,7 +784,7 @@ test("omitting create_agent_request worktree base-ref fields preserves legacy wi
   await expect(createPromise).rejects.toThrow("legacy git shape sentinel");
 });
 
-test("sends structured attachments with create_paseo_worktree_request", async () => {
+test("sends structured first-agent context attachments with create_paseo_worktree_request", async () => {
   const logger = createMockLogger();
   const mock = createMockTransport();
 
@@ -556,27 +804,25 @@ test("sends structured attachments with create_paseo_worktree_request", async ()
   const createPromise = client.createPaseoWorktree({
     cwd: "/tmp/project",
     worktreeSlug: "review-pr-123",
-    attachments: [
-      {
-        type: "github_pr",
-        mimeType: "application/github-pr",
-        number: 123,
-        title: "Fix race in worktree setup",
-        url: "https://github.com/getpaseo/paseo/pull/123",
-      },
-    ],
+    firstAgentContext: {
+      attachments: [
+        {
+          type: "github_pr",
+          mimeType: "application/github-pr",
+          number: 123,
+          title: "Fix race in worktree setup",
+          url: "https://github.com/getpaseo/paseo/pull/123",
+        },
+      ],
+    },
   });
 
   expect(mock.sent).toHaveLength(1);
-  const request = JSON.parse(String(mock.sent[0])) as {
-    type: "session";
-    message: {
-      type: "create_paseo_worktree_request";
-      requestId: string;
-      attachments: Array<{ type: string; mimeType: string; number: number }>;
-    };
-  };
-  expect(request.message.attachments).toEqual([
+  const request = parseSentFrame(mock.sent[0]);
+  const firstAgentContext = z
+    .object({ attachments: z.array(z.unknown()) })
+    .parse(request.firstAgentContext);
+  expect(firstAgentContext.attachments).toEqual([
     {
       type: "github_pr",
       mimeType: "application/github-pr",
@@ -590,7 +836,7 @@ test("sends structured attachments with create_paseo_worktree_request", async ()
     wrapSessionMessage({
       type: "create_paseo_worktree_response",
       payload: {
-        requestId: request.message.requestId,
+        requestId: request.requestId,
         workspace: null,
         error: "worktree attachment sentinel",
         setupTerminalId: null,
@@ -599,7 +845,7 @@ test("sends structured attachments with create_paseo_worktree_request", async ()
   );
 
   await expect(createPromise).resolves.toEqual({
-    requestId: request.message.requestId,
+    requestId: request.requestId,
     workspace: null,
     error: "worktree attachment sentinel",
     setupTerminalId: null,
@@ -635,19 +881,8 @@ test("sends worktree base-ref fields in create_paseo_worktree_request", async ()
   );
 
   expect(mock.sent).toHaveLength(1);
-  const request = JSON.parse(String(mock.sent[0])) as {
-    type: "session";
-    message: {
-      type: "create_paseo_worktree_request";
-      requestId: string;
-      cwd: string;
-      worktreeSlug: string;
-      refName: string;
-      action: string;
-      githubPrNumber: number;
-    };
-  };
-  expect(request.message).toEqual({
+  const request = parseSentFrame(mock.sent[0]);
+  expect(request).toEqual({
     type: "create_paseo_worktree_request",
     cwd: "/tmp/project",
     worktreeSlug: "review-pr-123",
@@ -661,7 +896,7 @@ test("sends worktree base-ref fields in create_paseo_worktree_request", async ()
     wrapSessionMessage({
       type: "create_paseo_worktree_response",
       payload: {
-        requestId: request.message.requestId,
+        requestId: request.requestId,
         workspace: null,
         error: "worktree ref fields sentinel",
         setupTerminalId: null,
@@ -670,7 +905,7 @@ test("sends worktree base-ref fields in create_paseo_worktree_request", async ()
   );
 
   await expect(createPromise).resolves.toEqual({
-    requestId: request.message.requestId,
+    requestId: request.requestId,
     workspace: null,
     error: "worktree ref fields sentinel",
     setupTerminalId: null,
@@ -702,7 +937,7 @@ test("omitting create_paseo_worktree_request worktree base-ref fields preserves 
     "req-worktree-legacy",
   );
 
-  expect(String(mock.sent[0])).toBe(
+  expect(assertStr(mock.sent[0])).toBe(
     JSON.stringify({
       type: "session",
       message: {
@@ -763,14 +998,8 @@ test("sends explicit shutdown_server_request via shutdownServer", async () => {
   const promise = lifecycleClient.shutdownServer("req-shutdown-1");
 
   expect(mock.sent).toHaveLength(1);
-  const request = JSON.parse(mock.sent[0]) as {
-    type: "session";
-    message: {
-      type: string;
-      requestId: string;
-    };
-  };
-  expect(request.message).toEqual({
+  const request = parseSentFrame(mock.sent[0]);
+  expect(request).toEqual({
     type: "shutdown_server_request",
     requestId: "req-shutdown-1",
   });
@@ -813,15 +1042,8 @@ test("restartServer remains restart-only and sends restart_server_request", asyn
   const promise = client.restartServer("settings_update", "req-restart-1");
 
   expect(mock.sent).toHaveLength(1);
-  const request = JSON.parse(mock.sent[0]) as {
-    type: "session";
-    message: {
-      type: string;
-      reason?: string;
-      requestId: string;
-    };
-  };
-  expect(request.message).toEqual({
+  const request = parseSentFrame(mock.sent[0]);
+  expect(request).toEqual({
     type: "restart_server_request",
     reason: "settings_update",
     requestId: "req-restart-1",
@@ -874,7 +1096,9 @@ test("transitions out of connecting when connect timeout elapses", async () => {
     expect(result.ok).toBe(false);
     if (!result.ok) {
       expect(result.error).toBeInstanceOf(Error);
-      expect((result.error as Error).message).toContain("Connection timed out");
+      if (result.error instanceof Error) {
+        expect(result.error.message).toContain("Connection timed out");
+      }
     }
     expect(client.getConnectionState().status).toBe("disconnected");
   } finally {
@@ -966,12 +1190,14 @@ test("logs configured runtime generation in connection transition events", async
   mock.triggerOpen();
   await connectPromise;
 
-  const transitionPayloads = logger.debug.mock.calls
-    .filter(([, message]) => message === "DaemonClientTransition")
-    .map(([payload]) => payload as { generation?: number | null });
+  const transitionPayloads = logger.debug.mock.calls.filter(
+    ([, message]) => message === "DaemonClientTransition",
+  );
   expect(transitionPayloads.length).toBeGreaterThan(0);
-  for (const payload of transitionPayloads) {
-    expect(payload.generation).toBe(7);
+  for (const [payload] of transitionPayloads) {
+    expect(
+      z.object({ generation: z.number().nullable().optional() }).parse(payload).generation,
+    ).toBe(7);
   }
 });
 
@@ -999,20 +1225,11 @@ test("subscribes to checkout diff updates via RPC handshake", async () => {
   );
 
   expect(mock.sent).toHaveLength(1);
-  const request = JSON.parse(mock.sent[0]) as {
-    type: "session";
-    message: {
-      type: "subscribe_checkout_diff_request";
-      subscriptionId: string;
-      cwd: string;
-      compare: { mode: "uncommitted" | "base"; baseRef?: string };
-      requestId: string;
-    };
-  };
-  expect(request.message.type).toBe("subscribe_checkout_diff_request");
-  expect(request.message.subscriptionId).toBe("checkout-sub-1");
-  expect(request.message.cwd).toBe("/tmp/project");
-  expect(request.message.compare).toEqual({ mode: "uncommitted" });
+  const request = parseSentFrame(mock.sent[0]);
+  expect(request.type).toBe("subscribe_checkout_diff_request");
+  expect(request.subscriptionId).toBe("checkout-sub-1");
+  expect(request.cwd).toBe("/tmp/project");
+  expect(request.compare).toEqual({ mode: "uncommitted" });
 
   mock.triggerMessage(
     JSON.stringify({
@@ -1024,7 +1241,7 @@ test("subscribes to checkout diff updates via RPC handshake", async () => {
           cwd: "/tmp/project",
           files: [],
           error: null,
-          requestId: request.message.requestId,
+          requestId: request.requestId,
         },
       },
     }),
@@ -1035,7 +1252,7 @@ test("subscribes to checkout diff updates via RPC handshake", async () => {
     cwd: "/tmp/project",
     files: [],
     error: null,
-    requestId: request.message.requestId,
+    requestId: request.requestId,
   });
 });
 
@@ -1059,19 +1276,10 @@ test("getCheckoutDiff uses one-shot subscription protocol", async () => {
   const promise = client.getCheckoutDiff("/tmp/project", { mode: "base", baseRef: "main" });
 
   expect(mock.sent).toHaveLength(1);
-  const subscribeRequest = JSON.parse(mock.sent[0]) as {
-    type: "session";
-    message: {
-      type: "subscribe_checkout_diff_request";
-      subscriptionId: string;
-      cwd: string;
-      compare: { mode: "uncommitted" | "base"; baseRef?: string };
-      requestId: string;
-    };
-  };
-  expect(subscribeRequest.message.type).toBe("subscribe_checkout_diff_request");
-  expect(subscribeRequest.message.cwd).toBe("/tmp/project");
-  expect(subscribeRequest.message.compare).toEqual({
+  const subscribeRequest = parseSentFrame(mock.sent[0]);
+  expect(subscribeRequest.type).toBe("subscribe_checkout_diff_request");
+  expect(subscribeRequest.cwd).toBe("/tmp/project");
+  expect(subscribeRequest.compare).toEqual({
     mode: "base",
     baseRef: "main",
   });
@@ -1082,11 +1290,11 @@ test("getCheckoutDiff uses one-shot subscription protocol", async () => {
       message: {
         type: "subscribe_checkout_diff_response",
         payload: {
-          subscriptionId: subscribeRequest.message.subscriptionId,
+          subscriptionId: subscribeRequest.subscriptionId,
           cwd: "/tmp/project",
           files: [],
           error: null,
-          requestId: subscribeRequest.message.requestId,
+          requestId: subscribeRequest.requestId,
         },
       },
     }),
@@ -1096,19 +1304,13 @@ test("getCheckoutDiff uses one-shot subscription protocol", async () => {
     cwd: "/tmp/project",
     files: [],
     error: null,
-    requestId: subscribeRequest.message.requestId,
+    requestId: subscribeRequest.requestId,
   });
 
   expect(mock.sent).toHaveLength(2);
-  const unsubscribeRequest = JSON.parse(mock.sent[1]) as {
-    type: "session";
-    message: {
-      type: "unsubscribe_checkout_diff_request";
-      subscriptionId: string;
-    };
-  };
-  expect(unsubscribeRequest.message.type).toBe("unsubscribe_checkout_diff_request");
-  expect(unsubscribeRequest.message.subscriptionId).toBe(subscribeRequest.message.subscriptionId);
+  const unsubscribeRequest = parseSentFrame(mock.sent[1]);
+  expect(unsubscribeRequest.type).toBe("unsubscribe_checkout_diff_request");
+  expect(unsubscribeRequest.subscriptionId).toBe(subscribeRequest.subscriptionId);
 });
 
 test("requests branch suggestions via RPC", async () => {
@@ -1134,21 +1336,12 @@ test("requests branch suggestions via RPC", async () => {
   );
 
   expect(mock.sent).toHaveLength(1);
-  const request = JSON.parse(mock.sent[0]) as {
-    type: "session";
-    message: {
-      type: "branch_suggestions_request";
-      cwd: string;
-      query?: string;
-      limit?: number;
-      requestId: string;
-    };
-  };
-  expect(request.message.type).toBe("branch_suggestions_request");
-  expect(request.message.cwd).toBe("/tmp/project");
-  expect(request.message.query).toBe("mai");
-  expect(request.message.limit).toBe(5);
-  expect(request.message.requestId).toBe("req-branches");
+  const request = parseSentFrame(mock.sent[0]);
+  expect(request.type).toBe("branch_suggestions_request");
+  expect(request.cwd).toBe("/tmp/project");
+  expect(request.query).toBe("mai");
+  expect(request.limit).toBe(5);
+  expect(request.requestId).toBe("req-branches");
 
   mock.triggerMessage(
     JSON.stringify({
@@ -1190,11 +1383,8 @@ test("reads project config via correlated RPC", async () => {
   const promise = client.readProjectConfig("/repo/app", "read-project-config-1");
 
   expect(mock.sent).toHaveLength(1);
-  const request = JSON.parse(mock.sent[0]) as {
-    type: "session";
-    message: { type: "read_project_config_request"; requestId: string; repoRoot: string };
-  };
-  expect(request.message).toEqual({
+  const request = parseSentFrame(mock.sent[0]);
+  expect(request).toEqual({
     type: "read_project_config_request",
     requestId: "read-project-config-1",
     repoRoot: "/repo/app",
@@ -1246,17 +1436,8 @@ test("writes project config via correlated RPC and returns inline failures", asy
   });
 
   expect(mock.sent).toHaveLength(1);
-  const request = JSON.parse(mock.sent[0]) as {
-    type: "session";
-    message: {
-      type: "write_project_config_request";
-      requestId: string;
-      repoRoot: string;
-      config: unknown;
-      expectedRevision: unknown;
-    };
-  };
-  expect(request.message).toEqual({
+  const request = parseSentFrame(mock.sent[0]);
+  expect(request).toEqual({
     type: "write_project_config_request",
     requestId: "write-project-config-1",
     repoRoot: "/repo/app",
@@ -1319,25 +1500,14 @@ test("requests directory suggestions via RPC", async () => {
   );
 
   expect(mock.sent).toHaveLength(1);
-  const request = JSON.parse(mock.sent[0]) as {
-    type: "session";
-    message: {
-      type: "directory_suggestions_request";
-      query: string;
-      cwd?: string;
-      includeFiles?: boolean;
-      includeDirectories?: boolean;
-      limit?: number;
-      requestId: string;
-    };
-  };
-  expect(request.message.type).toBe("directory_suggestions_request");
-  expect(request.message.query).toBe("proj");
-  expect(request.message.cwd).toBe("/tmp/project");
-  expect(request.message.includeFiles).toBe(true);
-  expect(request.message.includeDirectories).toBe(true);
-  expect(request.message.limit).toBe(10);
-  expect(request.message.requestId).toBe("req-directories");
+  const request = parseSentFrame(mock.sent[0]);
+  expect(request.type).toBe("directory_suggestions_request");
+  expect(request.query).toBe("proj");
+  expect(request.cwd).toBe("/tmp/project");
+  expect(request.includeFiles).toBe(true);
+  expect(request.includeDirectories).toBe(true);
+  expect(request.limit).toBe(10);
+  expect(request.requestId).toBe("req-directories");
 
   mock.triggerMessage(
     JSON.stringify({
@@ -1386,21 +1556,12 @@ test("requests checkout merge from base via RPC", async () => {
   );
 
   expect(mock.sent).toHaveLength(1);
-  const request = JSON.parse(mock.sent[0]) as {
-    type: "session";
-    message: {
-      type: "checkout_merge_from_base_request";
-      cwd: string;
-      baseRef?: string;
-      requireCleanTarget?: boolean;
-      requestId: string;
-    };
-  };
-  expect(request.message.type).toBe("checkout_merge_from_base_request");
-  expect(request.message.cwd).toBe("/tmp/project");
-  expect(request.message.baseRef).toBe("main");
-  expect(request.message.requireCleanTarget).toBe(true);
-  expect(request.message.requestId).toBe("req-merge-from-base");
+  const request = parseSentFrame(mock.sent[0]);
+  expect(request.type).toBe("checkout_merge_from_base_request");
+  expect(request.cwd).toBe("/tmp/project");
+  expect(request.baseRef).toBe("main");
+  expect(request.requireCleanTarget).toBe(true);
+  expect(request.requestId).toBe("req-merge-from-base");
 
   mock.triggerMessage(
     JSON.stringify({
@@ -1445,17 +1606,10 @@ test("requests checkout pull via RPC", async () => {
   const promise = client.checkoutPull("/tmp/project", "req-pull");
 
   expect(mock.sent).toHaveLength(1);
-  const request = JSON.parse(mock.sent[0]) as {
-    type: "session";
-    message: {
-      type: "checkout_pull_request";
-      cwd: string;
-      requestId: string;
-    };
-  };
-  expect(request.message.type).toBe("checkout_pull_request");
-  expect(request.message.cwd).toBe("/tmp/project");
-  expect(request.message.requestId).toBe("req-pull");
+  const request = parseSentFrame(mock.sent[0]);
+  expect(request.type).toBe("checkout_pull_request");
+  expect(request.cwd).toBe("/tmp/project");
+  expect(request.requestId).toBe("req-pull");
 
   mock.triggerMessage(
     JSON.stringify({
@@ -1509,22 +1663,13 @@ test("resubscribes checkout diff streams after reconnect", async () => {
   await connectPromise;
 
   expect(mock.sent).toHaveLength(1);
-  const request = JSON.parse(mock.sent[0]) as {
-    type: "session";
-    message: {
-      type: "subscribe_checkout_diff_request";
-      subscriptionId: string;
-      cwd: string;
-      compare: { mode: "uncommitted" | "base"; baseRef?: string };
-      requestId: string;
-    };
-  };
-  expect(request.message.type).toBe("subscribe_checkout_diff_request");
-  expect(request.message.subscriptionId).toBe("checkout-sub-1");
-  expect(request.message.cwd).toBe("/tmp/project");
-  expect(request.message.compare).toEqual({ mode: "base", baseRef: "main" });
-  expect(typeof request.message.requestId).toBe("string");
-  expect(request.message.requestId.length).toBeGreaterThan(0);
+  const request = parseSentFrame(mock.sent[0]);
+  expect(request.type).toBe("subscribe_checkout_diff_request");
+  expect(request.subscriptionId).toBe("checkout-sub-1");
+  expect(request.cwd).toBe("/tmp/project");
+  expect(request.compare).toEqual({ mode: "base", baseRef: "main" });
+  expect(typeof request.requestId).toBe("string");
+  expect(z.string().parse(request.requestId).length).toBeGreaterThan(0);
 });
 
 test("fetches agents via RPC with filters, sort, and pagination", async () => {
@@ -1555,27 +1700,14 @@ test("fetches agents via RPC with filters, sort, and pagination", async () => {
   });
 
   expect(mock.sent).toHaveLength(1);
-  const request = JSON.parse(mock.sent[0]) as {
-    type: "session";
-    message: {
-      type: "fetch_agents_request";
-      requestId: string;
-      filter?: { labels?: Record<string, string> };
-      sort?: Array<{
-        key: "status_priority" | "created_at" | "updated_at" | "title";
-        direction: "asc" | "desc";
-      }>;
-      page?: { limit: number; cursor?: string };
-      subscribe?: { subscriptionId?: string };
-    };
-  };
-  expect(request.message.type).toBe("fetch_agents_request");
-  expect(request.message.sort).toEqual([
+  const request = parseSentFrame(mock.sent[0]);
+  expect(request.type).toBe("fetch_agents_request");
+  expect(request.sort).toEqual([
     { key: "status_priority", direction: "asc" },
     { key: "created_at", direction: "desc" },
   ]);
-  expect(request.message.page).toEqual({ limit: 25, cursor: "cursor-1" });
-  expect(request.message.subscribe).toEqual({ subscriptionId: "sub-1" });
+  expect(request.page).toEqual({ limit: 25, cursor: "cursor-1" });
+  expect(request.subscribe).toEqual({ subscriptionId: "sub-1" });
 
   mock.triggerMessage(
     JSON.stringify({
@@ -1583,7 +1715,7 @@ test("fetches agents via RPC with filters, sort, and pagination", async () => {
       message: {
         type: "fetch_agents_response",
         payload: {
-          requestId: request.message.requestId,
+          requestId: request.requestId,
           subscriptionId: "sub-1",
           entries: [],
           pageInfo: {
@@ -1597,7 +1729,7 @@ test("fetches agents via RPC with filters, sort, and pagination", async () => {
   );
 
   await expect(promise).resolves.toEqual({
-    requestId: request.message.requestId,
+    requestId: request.requestId,
     subscriptionId: "sub-1",
     entries: [],
     pageInfo: {
@@ -1631,15 +1763,8 @@ test("sends active-scoped fetch_agents_request", async () => {
   });
 
   expect(mock.sent).toHaveLength(1);
-  const request = JSON.parse(String(mock.sent[0])) as {
-    type: "session";
-    message: {
-      type: "fetch_agents_request";
-      requestId: string;
-      scope?: "active";
-    };
-  };
-  expect(request.message).toMatchObject({
+  const request = parseSentFrame(mock.sent[0]);
+  expect(request).toMatchObject({
     type: "fetch_agents_request",
     scope: "active",
   });
@@ -1650,7 +1775,7 @@ test("sends active-scoped fetch_agents_request", async () => {
       message: {
         type: "fetch_agents_response",
         payload: {
-          requestId: request.message.requestId,
+          requestId: request.requestId,
           entries: [],
           pageInfo: {
             nextCursor: null,
@@ -1663,7 +1788,7 @@ test("sends active-scoped fetch_agents_request", async () => {
   );
 
   await expect(promise).resolves.toMatchObject({
-    requestId: request.message.requestId,
+    requestId: request.requestId,
     entries: [],
   });
 });
@@ -1691,16 +1816,9 @@ test("fetches paginated agent history separately from active agents", async () =
   });
 
   expect(mock.sent).toHaveLength(1);
-  const request = JSON.parse(String(mock.sent[0])) as {
-    type: "session";
-    message: {
-      type: "fetch_agent_history_request";
-      requestId: string;
-      page?: { limit: number; cursor?: string };
-    };
-  };
-  expect(request.message.type).toBe("fetch_agent_history_request");
-  expect(request.message.page).toEqual({ limit: 25, cursor: "cursor-1" });
+  const request = parseSentFrame(mock.sent[0]);
+  expect(request.type).toBe("fetch_agent_history_request");
+  expect(request.page).toEqual({ limit: 25, cursor: "cursor-1" });
 
   mock.triggerMessage(
     JSON.stringify({
@@ -1708,7 +1826,7 @@ test("fetches paginated agent history separately from active agents", async () =
       message: {
         type: "fetch_agent_history_response",
         payload: {
-          requestId: request.message.requestId,
+          requestId: request.requestId,
           entries: [],
           pageInfo: {
             nextCursor: null,
@@ -1721,7 +1839,7 @@ test("fetches paginated agent history separately from active agents", async () =
   );
 
   await expect(promise).resolves.toEqual({
-    requestId: request.message.requestId,
+    requestId: request.requestId,
     entries: [],
     pageInfo: {
       nextCursor: null,
@@ -1769,7 +1887,9 @@ test("uses server-provided dictation finish timeout budget", async () => {
   await vi.advanceTimersByTimeAsync(5_101);
   const error = await finishError;
   expect(error).toBeInstanceOf(Error);
-  expect((error as Error).message).toContain("Timeout waiting for dictation finalization (5100ms)");
+  if (error instanceof Error) {
+    expect(error.message).toContain("Timeout waiting for dictation finalization (5100ms)");
+  }
 
   vi.useRealTimers();
 });
@@ -1879,11 +1999,8 @@ test("lists available providers via RPC", async () => {
   const promise = client.listAvailableProviders();
   expect(mock.sent).toHaveLength(1);
 
-  const request = JSON.parse(mock.sent[0]) as {
-    type: "session";
-    message: { type: "list_available_providers_request"; requestId: string };
-  };
-  expect(request.message.type).toBe("list_available_providers_request");
+  const request = parseSentFrame(mock.sent[0]);
+  expect(request.type).toBe("list_available_providers_request");
 
   mock.triggerMessage(
     JSON.stringify({
@@ -1897,7 +2014,7 @@ test("lists available providers via RPC", async () => {
           ],
           error: null,
           fetchedAt: "2026-02-12T00:00:00.000Z",
-          requestId: request.message.requestId,
+          requestId: request.requestId,
         },
       },
     }),
@@ -1910,7 +2027,7 @@ test("lists available providers via RPC", async () => {
     ],
     error: null,
     fetchedAt: "2026-02-12T00:00:00.000Z",
-    requestId: request.message.requestId,
+    requestId: request.requestId,
   });
 });
 
@@ -1942,24 +2059,10 @@ test("lists commands with draft config via RPC", async () => {
   });
   expect(mock.sent).toHaveLength(1);
 
-  const request = JSON.parse(mock.sent[0]) as {
-    type: "session";
-    message: {
-      type: "list_commands_request";
-      agentId: string;
-      draftConfig?: {
-        provider: string;
-        cwd: string;
-        modeId?: string;
-        model?: string;
-        thinkingOptionId?: string;
-      };
-      requestId: string;
-    };
-  };
-  expect(request.message.type).toBe("list_commands_request");
-  expect(request.message.agentId).toBe("__new_agent__");
-  expect(request.message.draftConfig).toEqual({
+  const request = parseSentFrame(mock.sent[0]);
+  expect(request.type).toBe("list_commands_request");
+  expect(request.agentId).toBe("__new_agent__");
+  expect(request.draftConfig).toEqual({
     provider: "codex",
     cwd: "/tmp/project",
     modeId: "bypassPermissions",
@@ -1976,7 +2079,7 @@ test("lists commands with draft config via RPC", async () => {
           agentId: "__new_agent__",
           commands: [{ name: "help", description: "Show help", argumentHint: "" }],
           error: null,
-          requestId: request.message.requestId,
+          requestId: request.requestId,
         },
       },
     }),
@@ -1986,7 +2089,7 @@ test("lists commands with draft config via RPC", async () => {
     agentId: "__new_agent__",
     commands: [{ name: "help", description: "Show help", argumentHint: "" }],
     error: null,
-    requestId: request.message.requestId,
+    requestId: request.requestId,
   });
 });
 
@@ -2010,19 +2113,11 @@ test("lists commands with legacy requestId signature via RPC", async () => {
   const promise = client.listCommands("agent-1", "req-legacy");
   expect(mock.sent).toHaveLength(1);
 
-  const request = JSON.parse(mock.sent[0]) as {
-    type: "session";
-    message: {
-      type: "list_commands_request";
-      agentId: string;
-      draftConfig?: unknown;
-      requestId: string;
-    };
-  };
-  expect(request.message.type).toBe("list_commands_request");
-  expect(request.message.agentId).toBe("agent-1");
-  expect(request.message.requestId).toBe("req-legacy");
-  expect(request.message.draftConfig).toBeUndefined();
+  const request = parseSentFrame(mock.sent[0]);
+  expect(request.type).toBe("list_commands_request");
+  expect(request.agentId).toBe("agent-1");
+  expect(request.requestId).toBe("req-legacy");
+  expect(request.draftConfig).toBeUndefined();
 
   mock.triggerMessage(
     JSON.stringify({
@@ -2420,25 +2515,17 @@ test("parses canonical agent_stream tool_call payloads without crashing", async 
   unsubscribe();
 
   expect(received).toHaveLength(1);
-  const streamMsg = received[0] as {
+  expect(received[0]).toMatchObject({
     payload: {
       event: {
-        type: "timeline";
         item: {
-          type: "tool_call";
-          status: string;
-          error: unknown;
-          detail: {
-            type: string;
-          };
-        };
-      };
-    };
-  };
-
-  expect(streamMsg.payload.event.item.status).toBe("running");
-  expect(streamMsg.payload.event.item.error).toBeNull();
-  expect(streamMsg.payload.event.item.detail.type).toBe("shell");
+          status: "running",
+          error: null,
+          detail: { type: "shell" },
+        },
+      },
+    },
+  });
   expect(logger.warn).not.toHaveBeenCalled();
 });
 
@@ -2564,28 +2651,20 @@ test("parses canonical fetch_agent_timeline_response payloads without crashing",
   unsubscribe();
 
   expect(received).toHaveLength(1);
-  const timelineMsg = received[0] as {
+  expect(received[0]).toMatchObject({
     payload: {
-      entries: Array<{
-        item: {
-          type: "tool_call";
-          status: string;
-          error: unknown;
-          detail: {
-            type: string;
-          };
-        };
-      }>;
-    };
-  };
-
-  const firstEntry = timelineMsg.payload.entries[0];
-  expect(firstEntry?.item.type).toBe("tool_call");
-  if (firstEntry?.item.type === "tool_call") {
-    expect(firstEntry.item.status).toBe("running");
-    expect(firstEntry.item.error).toBeNull();
-    expect(firstEntry.item.detail.type).toBe("shell");
-  }
+      entries: [
+        {
+          item: {
+            type: "tool_call",
+            status: "running",
+            error: null,
+            detail: { type: "shell" },
+          },
+        },
+      ],
+    },
+  });
   expect(logger.warn).not.toHaveBeenCalled();
 });
 
@@ -2682,14 +2761,14 @@ test("sends subscribe/unsubscribe terminals messages", async () => {
   client.unsubscribeTerminals({ cwd: "/tmp/project" });
 
   expect(mock.sent).toHaveLength(2);
-  expect(JSON.parse(String(mock.sent[0]))).toEqual({
+  expect(JSON.parse(assertStr(mock.sent[0]))).toEqual({
     type: "session",
     message: {
       type: "subscribe_terminals_request",
       cwd: "/tmp/project",
     },
   });
-  expect(JSON.parse(String(mock.sent[1]))).toEqual({
+  expect(JSON.parse(assertStr(mock.sent[1]))).toEqual({
     type: "session",
     message: {
       type: "unsubscribe_terminals_request",
@@ -2773,7 +2852,7 @@ test("sends close_items_request and resolves close_items_response", async () => 
     "req-close-items",
   );
 
-  expect(JSON.parse(String(mock.sent[0]))).toEqual({
+  expect(JSON.parse(assertStr(mock.sent[0]))).toEqual({
     type: "session",
     message: {
       type: "close_items_request",
@@ -2823,18 +2902,10 @@ test("waitForFinish with timeout=0 omits timeoutMs and has no client deadline", 
     const waitPromise = client.waitForFinish("agent-wait-zero-timeout", 0);
 
     expect(mock.sent).toHaveLength(1);
-    const request = JSON.parse(String(mock.sent[0])) as {
-      type: "session";
-      message: {
-        type: "wait_for_finish_request";
-        requestId: string;
-        agentId: string;
-        timeoutMs?: number;
-      };
-    };
-    expect(request.message.type).toBe("wait_for_finish_request");
-    expect(request.message.agentId).toBe("agent-wait-zero-timeout");
-    expect(request.message).not.toHaveProperty("timeoutMs");
+    const request = parseSentFrame(mock.sent[0]);
+    expect(request.type).toBe("wait_for_finish_request");
+    expect(request.agentId).toBe("agent-wait-zero-timeout");
+    expect(request).not.toHaveProperty("timeoutMs");
 
     const settled = vi.fn();
     void waitPromise.then(
@@ -2849,7 +2920,7 @@ test("waitForFinish with timeout=0 omits timeoutMs and has no client deadline", 
       wrapSessionMessage({
         type: "wait_for_finish_response",
         payload: {
-          requestId: request.message.requestId,
+          requestId: request.requestId,
           status: "idle",
           final: null,
           error: null,

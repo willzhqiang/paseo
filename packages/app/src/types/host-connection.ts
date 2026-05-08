@@ -1,10 +1,10 @@
 import { normalizeHostPort, normalizeLoopbackToLocalhost } from "@server/shared/daemon-endpoints";
+import {
+  DirectTcpHostConnectionSchema,
+  type DirectTcpHostConnection,
+} from "@server/shared/host-connection-schema";
 
-export interface DirectTcpHostConnection {
-  id: string;
-  type: "directTcp";
-  endpoint: string;
-}
+export { DirectTcpHostConnectionSchema, type DirectTcpHostConnection };
 
 export interface DirectSocketHostConnection {
   id: string;
@@ -22,6 +22,7 @@ export interface RelayHostConnection {
   id: string;
   type: "relay";
   relayEndpoint: string;
+  useTls?: boolean;
   daemonPublicKeyB64: string;
 }
 
@@ -58,7 +59,11 @@ function hostConnectionEquals(left: HostConnection, right: HostConnection): bool
   }
 
   if (left.type === "directTcp" && right.type === "directTcp") {
-    return left.endpoint === right.endpoint;
+    return (
+      left.endpoint === right.endpoint &&
+      (left.useTls ?? false) === (right.useTls ?? false) &&
+      left.password === right.password
+    );
   }
   if (left.type === "directSocket" && right.type === "directSocket") {
     return left.path === right.path;
@@ -69,6 +74,7 @@ function hostConnectionEquals(left: HostConnection, right: HostConnection): bool
   if (left.type === "relay" && right.type === "relay") {
     return (
       left.relayEndpoint === right.relayEndpoint &&
+      left.useTls === right.useTls &&
       left.daemonPublicKeyB64 === right.daemonPublicKeyB64
     );
   }
@@ -130,9 +136,8 @@ export function upsertHostConnectionInProfiles(input: {
     return [...existing, profile];
   }
 
-  const matchedProfiles = matchingIndexes.map((index) => existing[index]!);
-  const prev =
-    matchedProfiles.find((daemon) => daemon.serverId === serverId) ?? matchedProfiles[0]!;
+  const matchedProfiles = matchingIndexes.map((index) => existing[index]);
+  const prev = matchedProfiles.find((daemon) => daemon.serverId === serverId) ?? matchedProfiles[0];
   const nextConnections = dedupeHostConnections([
     ...matchedProfiles.flatMap((daemon) => daemon.connections),
     input.connection,
@@ -176,7 +181,7 @@ export function upsertHostConnectionInProfiles(input: {
     updatedAt: now,
   };
 
-  const firstIndex = matchingIndexes[0]!;
+  const firstIndex = matchingIndexes[0];
   const matchingIndexSet = new Set(matchingIndexes);
   const next = existing.filter((_daemon, index) => !matchingIndexSet.has(index));
   next.splice(firstIndex, 0, nextProfile);
@@ -227,39 +232,59 @@ export function connectionFromListen(listen: string): HostConnection | null {
   }
 }
 
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function toObjectRecord(value: unknown): Record<string, unknown> | undefined {
+  return isPlainRecord(value) ? value : undefined;
+}
+
 function normalizeStoredConnection(connection: unknown): HostConnection | null {
-  if (!connection || typeof connection !== "object") {
+  const record = toObjectRecord(connection);
+  if (!record) {
     return null;
   }
-  const record = connection as Record<string, unknown>;
-  const type = typeof record.type === "string" ? record.type : null;
+  const type = record.type;
   if (type === "directTcp") {
     try {
       const endpoint = normalizeLoopbackToLocalhost(
-        normalizeHostPort(String(record.endpoint ?? "")),
+        normalizeHostPort(typeof record.endpoint === "string" ? record.endpoint : ""),
       );
-      return { id: `direct:${endpoint}`, type: "directTcp", endpoint };
+      return DirectTcpHostConnectionSchema.parse({
+        id: `direct:${endpoint}`,
+        type: "directTcp",
+        endpoint,
+        useTls: record.useTls,
+        ...(typeof record.password === "string" ? { password: record.password } : {}),
+      });
     } catch {
       return null;
     }
   }
   if (type === "directSocket") {
-    const path = String(record.path ?? "").trim();
+    const path = (typeof record.path === "string" ? record.path : "").trim();
     return path ? { id: `socket:${path}`, type: "directSocket", path } : null;
   }
   if (type === "directPipe") {
-    const path = String(record.path ?? "").trim();
+    const path = (typeof record.path === "string" ? record.path : "").trim();
     return path ? { id: `pipe:${path}`, type: "directPipe", path } : null;
   }
   if (type === "relay") {
     try {
-      const relayEndpoint = normalizeHostPort(String(record.relayEndpoint ?? ""));
-      const daemonPublicKeyB64 = String(record.daemonPublicKeyB64 ?? "").trim();
+      const relayEndpoint = normalizeHostPort(
+        typeof record.relayEndpoint === "string" ? record.relayEndpoint : "",
+      );
+      const daemonPublicKeyB64 = (
+        typeof record.daemonPublicKeyB64 === "string" ? record.daemonPublicKeyB64 : ""
+      ).trim();
       if (!daemonPublicKeyB64) return null;
+      const useTls = typeof record.useTls === "boolean" ? record.useTls : undefined;
       return {
-        id: `relay:${relayEndpoint}`,
+        id: useTls === true ? `relay:wss:${relayEndpoint}` : `relay:${relayEndpoint}`,
         type: "relay",
         relayEndpoint,
+        ...(useTls !== undefined ? { useTls } : {}),
         daemonPublicKeyB64,
       };
     } catch {
@@ -271,10 +296,10 @@ function normalizeStoredConnection(connection: unknown): HostConnection | null {
 }
 
 export function normalizeStoredHostProfile(entry: unknown): HostProfile | null {
-  if (!entry || typeof entry !== "object") {
+  const record = toObjectRecord(entry);
+  if (!record) {
     return null;
   }
-  const record = entry as Record<string, unknown>;
   const serverId = typeof record.serverId === "string" ? record.serverId.trim() : "";
   if (!serverId) {
     return null;

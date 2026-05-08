@@ -8,6 +8,7 @@ import type {
 } from "./agent-sdk-types.js";
 import type { AgentManager, ManagedAgent, WaitForAgentResult } from "./agent-manager.js";
 import { curateAgentActivity } from "./activity-curator.js";
+import { selectItemsByProjectedLimit } from "./timeline-projection.js";
 import type { AgentStorage } from "./agent-storage.js";
 import { ensureAgentLoaded } from "./agent-loading.js";
 import { serializeAgentSnapshot } from "../messages.js";
@@ -85,7 +86,7 @@ export function resolveRequiredProviderModel(
   }
 
   return {
-    provider: provider as AgentProvider,
+    provider: provider,
     model,
   };
 }
@@ -147,7 +148,12 @@ export async function waitForAgentWithTimeout(
     if (error instanceof Error && error.message === "wait timeout") {
       const snapshot = agentManager.getAgent(agentId);
       const timeline = agentManager.getTimeline(agentId);
-      const recentActivity = curateAgentActivity(timeline.slice(-5));
+      const recent = selectItemsByProjectedLimit({
+        items: timeline,
+        direction: "tail",
+        limit: 5,
+      });
+      const recentActivity = curateAgentActivity(recent.items);
       const waitedSeconds = Math.round(AGENT_WAIT_TIMEOUT_MS / 1000);
       const message = `Awaiting the agent timed out after ${waitedSeconds}s. This does not mean the agent failed - call wait_for_agent again to continue waiting.\n\nRecent activity:\n${recentActivity}`;
       return {
@@ -168,7 +174,13 @@ export function startAgentRun(
   prompt: AgentPromptInput,
   logger: Logger,
   options?: StartAgentRunOptions,
-): void {
+): { outOfBand: boolean } {
+  // Out-of-band commands (e.g. /goal pause) must run WITHOUT canceling an
+  // in-flight turn — replaceAgentRun would interrupt the running turn. The
+  // intercept lives at this layer so it covers every prompt entrypoint.
+  if (agentManager.tryRunOutOfBand(agentId, prompt)) {
+    return { outOfBand: true };
+  }
   const shouldReplace = Boolean(options?.replaceRunning && agentManager.hasInFlightRun(agentId));
   const runOptions = options?.runOptions;
   const iterator = shouldReplace
@@ -183,6 +195,7 @@ export function startAgentRun(
       logger.error({ err: error, agentId }, "Agent stream failed");
     }
   })();
+  return { outOfBand: false };
 }
 
 /**
@@ -231,7 +244,9 @@ export interface SendPromptToAgentParams {
  * Every surface that sends a prompt to an agent (Session/WS, MCP, CLI-through-MCP)
  * MUST go through this so behavior can never drift between them.
  */
-export async function sendPromptToAgent(params: SendPromptToAgentParams): Promise<void> {
+export async function sendPromptToAgent(
+  params: SendPromptToAgentParams,
+): Promise<{ outOfBand: boolean }> {
   const {
     agentManager,
     agentStorage,
@@ -265,7 +280,7 @@ export async function sendPromptToAgent(params: SendPromptToAgentParams): Promis
     logger.error({ err: error, agentId }, "Failed to record user message");
   }
 
-  startAgentRun(agentManager, agentId, prompt, logger, {
+  return startAgentRun(agentManager, agentId, prompt, logger, {
     replaceRunning: true,
     runOptions,
   });
@@ -321,11 +336,11 @@ export function setupFinishNotification(params: SetupFinishNotificationParams): 
           return;
         }
         if (event.agent.lifecycle === "error") {
-          notify("errored");
+          void notify("errored");
           return;
         }
         if (event.agent.lifecycle === "idle" && hasSeenRunning) {
-          notify("finished");
+          void notify("finished");
           return;
         }
         if (event.agent.lifecycle === "closed") {
@@ -337,7 +352,7 @@ export function setupFinishNotification(params: SetupFinishNotificationParams): 
       }
 
       if (event.event.type === "permission_requested") {
-        notify("needs permission");
+        void notify("needs permission");
       }
     },
     { agentId: childAgentId, replayState: false },
@@ -356,7 +371,7 @@ export function setupFinishNotification(params: SetupFinishNotificationParams): 
   if (childSnapshot.lifecycle === "running") {
     hasSeenRunning = true;
   } else if (childSnapshot.lifecycle === "error") {
-    notify("errored");
+    void notify("errored");
   }
 }
 

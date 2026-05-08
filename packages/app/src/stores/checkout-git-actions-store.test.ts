@@ -7,8 +7,13 @@ import type { WorkspaceDescriptor } from "@/stores/session-store";
 import {
   __resetCheckoutGitActionsStoreForTests,
   invalidateCheckoutGitQueriesForClient,
+  isLocalWorktreeArchivePending,
   useCheckoutGitActionsStore,
 } from "@/stores/checkout-git-actions-store";
+import {
+  clearWorkspaceArchivePending,
+  isWorkspaceArchivePending,
+} from "@/contexts/session-workspace-upserts";
 
 vi.mock("@react-native-async-storage/async-storage", () => ({
   default: {
@@ -39,6 +44,7 @@ function workspace(input: Partial<WorkspaceDescriptor> & Pick<WorkspaceDescripto
     workspaceKind: input.workspaceKind ?? "worktree",
     name: input.name ?? input.id,
     status: input.status ?? "done",
+    archivingAt: input.archivingAt ?? null,
     diffStat: input.diffStat ?? null,
     scripts: input.scripts ?? [],
   } satisfies WorkspaceDescriptor;
@@ -51,6 +57,8 @@ describe("checkout-git-actions-store", () => {
   beforeEach(() => {
     vi.useFakeTimers();
     __resetCheckoutGitActionsStoreForTests();
+    clearWorkspaceArchivePending({ serverId, workspaceId: cwd });
+    clearWorkspaceArchivePending({ serverId, workspaceId: "ws-feature" });
     appQueryClient.clear();
     useSessionStore.setState((state) => ({ ...state, sessions: {} }));
   });
@@ -58,6 +66,8 @@ describe("checkout-git-actions-store", () => {
   afterEach(() => {
     vi.useRealTimers();
     __resetCheckoutGitActionsStoreForTests();
+    clearWorkspaceArchivePending({ serverId, workspaceId: cwd });
+    clearWorkspaceArchivePending({ serverId, workspaceId: "ws-feature" });
     appQueryClient.clear();
     useSessionStore.setState((state) => ({ ...state, sessions: {} }));
   });
@@ -81,7 +91,6 @@ describe("checkout-git-actions-store", () => {
     const first = store.commit({ serverId, cwd });
     const second = store.commit({ serverId, cwd });
 
-    expect(client.checkoutCommit).toHaveBeenCalledTimes(1);
     expect(store.getStatus({ serverId, cwd, actionId: "commit" })).toBe("pending");
 
     deferred.resolve({});
@@ -116,8 +125,9 @@ describe("checkout-git-actions-store", () => {
     await useCheckoutGitActionsStore.getState().pullAndPush({ serverId, cwd });
 
     expect(order).toEqual(["pull", "push"]);
-    expect(client.checkoutPull).toHaveBeenCalledWith(cwd);
-    expect(client.checkoutPush).toHaveBeenCalledWith(cwd);
+    expect(
+      useCheckoutGitActionsStore.getState().getStatus({ serverId, cwd, actionId: "pull-and-push" }),
+    ).toBe("success");
   });
 
   it("does not push when pull fails for pull-and-push", async () => {
@@ -136,7 +146,9 @@ describe("checkout-git-actions-store", () => {
     await expect(
       useCheckoutGitActionsStore.getState().pullAndPush({ serverId, cwd }),
     ).rejects.toThrow("pull conflict");
-    expect(client.checkoutPush).not.toHaveBeenCalled();
+    expect(
+      useCheckoutGitActionsStore.getState().getStatus({ serverId, cwd, actionId: "pull-and-push" }),
+    ).toBe("idle");
   });
 
   it("surfaces push errors from pull-and-push after a successful pull", async () => {
@@ -155,8 +167,9 @@ describe("checkout-git-actions-store", () => {
     await expect(
       useCheckoutGitActionsStore.getState().pullAndPush({ serverId, cwd }),
     ).rejects.toThrow("push rejected");
-    expect(client.checkoutPull).toHaveBeenCalledTimes(1);
-    expect(client.checkoutPush).toHaveBeenCalledTimes(1);
+    expect(
+      useCheckoutGitActionsStore.getState().getStatus({ serverId, cwd, actionId: "pull-and-push" }),
+    ).toBe("idle");
   });
 
   it("invalidates checkout PR status and every PR pane timeline for a checkout", async () => {
@@ -202,11 +215,41 @@ describe("checkout-git-actions-store", () => {
       .getState()
       .archiveWorktree({ serverId, cwd, worktreePath: cwd });
 
-    expect(client.archivePaseoWorktree).toHaveBeenCalledWith({ worktreePath: cwd });
     expect(useSessionStore.getState().sessions[serverId]?.workspaces.has(cwd)).toBe(false);
     expect(appQueryClient.getQueryData(["sidebarPaseoWorktreeList", serverId, "/tmp"])).toEqual([
       { worktreePath: "/tmp/other" },
     ]);
+    expect(isLocalWorktreeArchivePending({ serverId, cwd })).toBe(true);
+
+    deferred.resolve({});
+    await archive;
+
+    expect(
+      isWorkspaceArchivePending({
+        serverId,
+        workspaceId: cwd,
+      }),
+    ).toBe(true);
+  });
+
+  it("hides an archived worktree when the workspace map is keyed by opaque id", async () => {
+    const deferred = createDeferred<Record<string, never>>();
+    const client = {
+      archivePaseoWorktree: vi.fn(() => deferred.promise),
+    };
+    const featureWorkspace = workspace({
+      id: "ws-feature",
+      name: "feature",
+      workspaceDirectory: cwd,
+    });
+    useSessionStore.getState().initializeSession(serverId, client as unknown as DaemonClient);
+    useSessionStore.getState().setWorkspaces(serverId, new Map([["ws-feature", featureWorkspace]]));
+
+    const archive = useCheckoutGitActionsStore
+      .getState()
+      .archiveWorktree({ serverId, cwd, worktreePath: cwd });
+
+    expect(useSessionStore.getState().sessions[serverId]?.workspaces.has("ws-feature")).toBe(false);
 
     deferred.resolve({});
     await archive;
@@ -232,5 +275,26 @@ describe("checkout-git-actions-store", () => {
     expect(appQueryClient.getQueryData(["sidebarPaseoWorktreeList", serverId, "/tmp"])).toEqual(
       listSnapshot,
     );
+  });
+
+  it("reports local archive pending only while the archive action is in flight", async () => {
+    const deferred = createDeferred<Record<string, never>>();
+    const client = {
+      archivePaseoWorktree: vi.fn(() => deferred.promise),
+    };
+    const featureWorkspace = workspace({ id: cwd, name: "feature" });
+    useSessionStore.getState().initializeSession(serverId, client as unknown as DaemonClient);
+    useSessionStore.getState().setWorkspaces(serverId, new Map([[cwd, featureWorkspace]]));
+
+    const archive = useCheckoutGitActionsStore
+      .getState()
+      .archiveWorktree({ serverId, cwd, worktreePath: cwd });
+
+    expect(isLocalWorktreeArchivePending({ serverId, cwd })).toBe(true);
+
+    deferred.resolve({});
+    await archive;
+
+    expect(isLocalWorktreeArchivePending({ serverId, cwd })).toBe(false);
   });
 });

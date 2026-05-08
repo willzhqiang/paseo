@@ -12,12 +12,9 @@ import {
   processTimelineResponse,
   type ProcessTimelineResponseOutput,
   type TimelineReducerSideEffect,
-} from "@/contexts/session-stream-reducers";
-import type {
-  AgentAttachment,
-  AgentStreamEventPayload,
-  SessionOutboundMessage,
-} from "@server/shared/messages";
+} from "@/timeline/session-stream-reducers";
+import { TIMELINE_FETCH_PAGE_SIZE } from "@/timeline/timeline-fetch-policy";
+import type { AgentAttachment, SessionOutboundMessage } from "@server/shared/messages";
 import { parseServerInfoStatusPayload } from "@server/shared/messages";
 import {
   buildAgentAttentionNotificationPayload,
@@ -58,6 +55,10 @@ import type { AttachmentMetadata } from "@/attachments/types";
 import { splitComposerAttachmentsForSubmit } from "@/components/composer-attachments";
 import { reconcilePreviousAgentStatuses } from "@/contexts/session-status-tracking";
 import { patchWorkspaceScripts } from "@/contexts/session-workspace-scripts";
+import {
+  clearWorkspaceArchivePending,
+  shouldSuppressWorkspaceForLocalArchive,
+} from "@/contexts/session-workspace-upserts";
 import { isNative } from "@/constants/platform";
 import { useToast } from "@/contexts/toast-context";
 import { toErrorMessage } from "@/utils/error-messages";
@@ -449,6 +450,7 @@ function SessionProviderInternal({ children, serverId, client }: SessionProvider
   const setAgentStreamState = useSessionStore((state) => state.setAgentStreamState);
   const clearAgentStreamHead = useSessionStore((state) => state.clearAgentStreamHead);
   const setAgentTimelineCursor = useSessionStore((state) => state.setAgentTimelineCursor);
+  const setAgentTimelineHasOlder = useSessionStore((state) => state.setAgentTimelineHasOlder);
   const setInitializingAgents = useSessionStore((state) => state.setInitializingAgents);
   const bumpHistorySyncGeneration = useSessionStore((state) => state.bumpHistorySyncGeneration);
   const markAgentHistorySynchronized = useSessionStore(
@@ -539,6 +541,9 @@ function SessionProviderInternal({ children, serverId, client }: SessionProvider
 
         for (const entry of payload.entries) {
           const workspace = normalizeWorkspaceDescriptor(entry);
+          if (shouldSuppressWorkspaceForLocalArchive({ serverId, workspace })) {
+            continue;
+          }
           workspaces.set(workspace.id, workspace);
         }
 
@@ -746,17 +751,15 @@ function SessionProviderInternal({ children, serverId, client }: SessionProvider
       if (isNative) {
         const session = useSessionStore.getState().sessions[serverId];
         const agentId = session?.focusedAgentId;
-        const cursor = agentId ? session?.agentTimelineCursor.get(agentId) : undefined;
-        if (agentId && cursor) {
+        if (agentId) {
           void client
             .fetchAgentTimeline(agentId, {
-              direction: "after",
-              cursor: { epoch: cursor.epoch, seq: cursor.endSeq },
-              limit: 0,
+              direction: "tail",
+              limit: TIMELINE_FETCH_PAGE_SIZE,
               projection: "canonical",
             })
             .catch((error) => {
-              console.warn("[Session] failed to fetch catch-up timeline on resume", agentId, error);
+              console.warn("[Session] failed to fetch tail timeline on resume", agentId, error);
             });
         }
       }
@@ -862,11 +865,7 @@ function SessionProviderInternal({ children, serverId, client }: SessionProvider
   }, [client, isConnected, serverId]);
 
   useEffect(() => {
-    if (!voiceRuntime) {
-      return;
-    }
-
-    return voiceRuntime.registerSession({
+    const unregister = voiceRuntime?.registerSession({
       serverId,
       setVoiceMode: async (enabled, agentId) => {
         if (!client) {
@@ -896,6 +895,7 @@ function SessionProviderInternal({ children, serverId, client }: SessionProvider
         setIsPlayingAudio(serverId, isPlaying);
       },
     });
+    return () => unregister?.();
   }, [client, serverId, setIsPlayingAudio, voiceRuntime]);
 
   useEffect(() => {
@@ -913,7 +913,7 @@ function SessionProviderInternal({ children, serverId, client }: SessionProvider
 
   useEffect(() => {
     if (!client || !isConnected) {
-      return;
+      return () => {};
     }
 
     let cancelled = false;
@@ -1022,7 +1022,7 @@ function SessionProviderInternal({ children, serverId, client }: SessionProvider
         .fetchAgentTimeline(agentId, {
           direction: "after",
           cursor: { epoch: cursor.epoch, seq: cursor.endSeq },
-          limit: 0,
+          limit: TIMELINE_FETCH_PAGE_SIZE,
           projection: "canonical",
         })
         .catch((error) => {
@@ -1052,6 +1052,15 @@ function SessionProviderInternal({ children, serverId, client }: SessionProvider
       const currentCursor = session?.agentTimelineCursor.get(agentId);
       const currentTail = session?.agentStreamTail.get(agentId) ?? [];
       const currentHead = session?.agentStreamHead.get(agentId) ?? [];
+
+      setAgentTimelineHasOlder(serverId, (prev) => {
+        if (prev.get(agentId) === payload.hasOlder) {
+          return prev;
+        }
+        const next = new Map(prev);
+        next.set(agentId, payload.hasOlder);
+        return next;
+      });
 
       if (payload.agent) {
         const normalized = normalizeAgentSnapshot(payload.agent, serverId);
@@ -1125,6 +1134,7 @@ function SessionProviderInternal({ children, serverId, client }: SessionProvider
       setAgentStreamHead,
       setAgentStreamTail,
       setAgentTimelineCursor,
+      setAgentTimelineHasOlder,
       setInitializingAgents,
     ],
   );
@@ -1184,7 +1194,7 @@ function SessionProviderInternal({ children, serverId, client }: SessionProvider
       if (message.type !== "agent_stream") return;
       const { agentId, event, timestamp, seq, epoch } = message.payload;
       const parsedTimestamp = new Date(timestamp);
-      const streamEvent = event as AgentStreamEventPayload;
+      const streamEvent = event;
       if (
         event.type === "turn_started" ||
         event.type === "turn_completed" ||
@@ -1227,11 +1237,18 @@ function SessionProviderInternal({ children, serverId, client }: SessionProvider
     const unsubWorkspaceUpdate = client.on("workspace_update", (message) => {
       if (message.type !== "workspace_update") return;
       if (message.payload.kind === "remove") {
-        removeWorkspaceSetup({ serverId, workspaceId: String(message.payload.id) });
-        removeWorkspace(serverId, String(message.payload.id));
+        clearWorkspaceArchivePending({
+          serverId,
+          workspaceId: message.payload.id,
+        });
+        removeWorkspaceSetup({ serverId, workspaceId: message.payload.id });
+        removeWorkspace(serverId, message.payload.id);
         return;
       }
       const workspace = normalizeWorkspaceDescriptor(message.payload.workspace);
+      if (shouldSuppressWorkspaceForLocalArchive({ serverId, workspace })) {
+        return;
+      }
       mergeWorkspaces(serverId, [workspace]);
     });
 
@@ -1383,15 +1400,10 @@ function SessionProviderInternal({ children, serverId, client }: SessionProvider
       }
 
       if (data.type === "tool_call" && data.metadata) {
-        const {
-          toolCallId,
-          toolName,
-          arguments: args,
-        } = data.metadata as {
-          toolCallId: string;
-          toolName: string;
-          arguments: unknown;
-        };
+        const toolCallId =
+          typeof data.metadata.toolCallId === "string" ? data.metadata.toolCallId : "";
+        const toolName = typeof data.metadata.toolName === "string" ? data.metadata.toolName : "";
+        const args = data.metadata.arguments;
 
         setMessages(serverId, (prev) => [
           ...prev,
@@ -1408,10 +1420,9 @@ function SessionProviderInternal({ children, serverId, client }: SessionProvider
       }
 
       if (data.type === "tool_result" && data.metadata) {
-        const { toolCallId, result } = data.metadata as {
-          toolCallId: string;
-          result: unknown;
-        };
+        const toolCallId =
+          typeof data.metadata.toolCallId === "string" ? data.metadata.toolCallId : "";
+        const result = data.metadata.result;
 
         const applyToolResult = applyToolResultToMessages(toolCallId, result);
         setMessages(serverId, applyToolResult);
@@ -1419,10 +1430,9 @@ function SessionProviderInternal({ children, serverId, client }: SessionProvider
       }
 
       if (data.type === "error" && data.metadata && "toolCallId" in data.metadata) {
-        const { toolCallId, error } = data.metadata as {
-          toolCallId: string;
-          error: unknown;
-        };
+        const toolCallId =
+          typeof data.metadata.toolCallId === "string" ? data.metadata.toolCallId : "";
+        const error = data.metadata.error;
 
         const applyToolError = applyToolErrorToMessages(toolCallId, error);
         setMessages(serverId, applyToolError);
@@ -1780,7 +1790,7 @@ function SessionProviderInternal({ children, serverId, client }: SessionProvider
       } catch (error) {
         console.error("[Session] Failed to prepare images for agent creation:", error);
       }
-      return client.createAgent({
+      await client.createAgent({
         config,
         ...(trimmedPrompt ? { initialPrompt: trimmedPrompt } : {}),
         ...(imagesData && imagesData.length > 0 ? { images: imagesData } : {}),

@@ -1,4 +1,5 @@
 import type { z } from "zod";
+import { CLIENT_CAPS } from "../shared/client-capabilities.js";
 import {
   AgentCreateFailedStatusPayloadSchema,
   AgentCreatedStatusPayloadSchema,
@@ -59,7 +60,6 @@ import type {
   ListTerminalsResponse,
   CreateTerminalResponse,
   SubscribeTerminalResponse,
-  TerminalState,
   CloseItemsResponse,
   KillTerminalResponse,
   CaptureTerminalResponse,
@@ -82,13 +82,12 @@ import type { MutableDaemonConfig, MutableDaemonConfigPatch } from "../shared/me
 import { isRelayClientWebSocketUrl } from "../shared/daemon-endpoints.js";
 import {
   asUint8Array,
-  decodeTerminalSnapshotPayload,
+  decodeFileTransferFrame,
   decodeTerminalStreamFrame,
-  encodeTerminalResizePayload,
-  encodeTerminalStreamFrame,
+  FileTransferOpcode,
   TerminalStreamOpcode,
-  type TerminalStreamFrame,
-} from "../shared/terminal-stream-protocol.js";
+  type FileTransferFrame,
+} from "../shared/binary-frames/index.js";
 import {
   createRelayE2eeTransportFactory,
   createWebSocketTransportFactory,
@@ -96,12 +95,12 @@ import {
   defaultWebSocketFactory,
   describeTransportClose,
   describeTransportError,
-  encodeUtf8String,
   type DaemonTransport,
   type DaemonTransportFactory,
   type WebSocketFactory,
 } from "./daemon-client-transport.js";
 import { DaemonClientRuntimeMetrics } from "./daemon-client-runtime-metrics.js";
+import { TerminalStreamRouter, type TerminalStreamEvent } from "./terminal-stream-router.js";
 
 export interface Logger {
   debug(obj: object, msg?: string): void;
@@ -122,6 +121,20 @@ const perfNow: () => number =
     ? () => performance.now()
     : () => Date.now();
 
+export interface ImportAgentInput {
+  provider: AgentProvider;
+  sessionId: string;
+  cwd?: string;
+  labels?: Record<string, string>;
+}
+
+function normalizePassword(value: string | undefined): string | null {
+  if (typeof value !== "string") {
+    return null;
+  }
+  return value.length > 0 ? value : null;
+}
+
 export type {
   DaemonTransport,
   DaemonTransportFactory,
@@ -129,9 +142,7 @@ export type {
   WebSocketLike,
 } from "./daemon-client-transport.js";
 
-export type TerminalStreamEvent =
-  | { terminalId: string; type: "output"; data: Uint8Array }
-  | { terminalId: string; type: "snapshot"; state: TerminalState };
+export type { TerminalStreamEvent };
 
 export type ConnectionState =
   | { status: "idle" }
@@ -191,6 +202,7 @@ export interface DaemonClientConfig {
   clientType?: "mobile" | "browser" | "cli" | "mcp";
   appVersion?: string;
   runtimeGeneration?: number | null;
+  password?: string;
   authHeader?: string;
   suppressSendErrors?: boolean;
   transportFactory?: DaemonTransportFactory;
@@ -236,7 +248,7 @@ export interface CreateAgentRequestOptions extends AgentConfigOverrides {
 
 export interface CreatePaseoWorktreeInput extends Pick<
   CreatePaseoWorktreeRequest,
-  "cwd" | "worktreeSlug" | "attachments" | "refName" | "action" | "githubPrNumber"
+  "cwd" | "worktreeSlug" | "firstAgentContext" | "refName" | "action" | "githubPrNumber"
 > {}
 
 type CheckoutStatusPayload = CheckoutStatusResponse["payload"];
@@ -268,6 +280,16 @@ type CreatePaseoWorktreePayload = Extract<
   { type: "create_paseo_worktree_response" }
 >["payload"];
 type FileExplorerPayload = FileExplorerResponse["payload"];
+export type FileExplorerDirectoryPayload = NonNullable<FileExplorerPayload["directory"]>;
+type LegacyFileExplorerFilePayload = NonNullable<FileExplorerPayload["file"]>;
+export interface FileReadResult {
+  bytes: Uint8Array;
+  mime: string;
+  size: number;
+  path: string;
+  kind: LegacyFileExplorerFilePayload["kind"];
+  modifiedAt: string;
+}
 type FileDownloadTokenPayload = FileDownloadTokenResponse["payload"];
 type ListProviderFeaturesPayload = ListProviderFeaturesResponseMessage["payload"];
 type ListProviderModelsPayload = ListProviderModelsResponseMessage["payload"];
@@ -366,6 +388,14 @@ type ScheduleDeletePayload = Extract<
   SessionOutboundMessage,
   { type: "schedule/delete/response" }
 >["payload"];
+type ScheduleRunOncePayload = Extract<
+  SessionOutboundMessage,
+  { type: "schedule/run-once/response" }
+>["payload"];
+type ScheduleUpdatePayload = Extract<
+  SessionOutboundMessage,
+  { type: "schedule/update/response" }
+>["payload"];
 export type FetchAgentTimelinePayload = FetchAgentTimelineResponseMessage["payload"];
 
 export type FetchAgentTimelineDirection = FetchAgentTimelinePayload["direction"];
@@ -453,8 +483,10 @@ export interface RunLoopOptions {
   cwd: string;
   provider?: string;
   model?: string;
+  modeId?: string;
   verifierProvider?: string;
   verifierModel?: string;
+  verifierModeId?: string;
   verifyPrompt?: string | null;
   verifyChecks?: string[];
   name?: string | null;
@@ -517,10 +549,35 @@ export interface CreateScheduleOptions {
       };
   maxRuns?: number;
   expiresAt?: string;
+  runOnCreate?: boolean;
   requestId?: string;
 }
 export interface InspectScheduleOptions {
   id: string;
+  requestId?: string;
+}
+export interface UpdateScheduleNewAgentConfig {
+  provider?: string;
+  model?: string | null;
+  modeId?: string | null;
+  cwd?: string;
+}
+export interface UpdateScheduleOptions {
+  id: string;
+  name?: string | null;
+  prompt?: string;
+  cadence?:
+    | {
+        type: "every";
+        everyMs: number;
+      }
+    | {
+        type: "cron";
+        expression: string;
+      };
+  newAgentConfig?: UpdateScheduleNewAgentConfig;
+  maxRuns?: number | null;
+  expiresAt?: string | null;
   requestId?: string;
 }
 type ListAvailableEditorsPayload = ListAvailableEditorsResponseMessage["payload"];
@@ -544,14 +601,30 @@ export interface WaitForFinishResult {
 
 interface Waiter<T> {
   predicate: (msg: SessionOutboundMessage) => T | null;
-  resolve: (value: T) => void;
-  reject: (error: Error) => void;
+  resolve(value: T): void;
+  reject(error: Error): void;
   timeoutHandle: ReturnType<typeof setTimeout> | null;
 }
 
 interface WaitHandle<T> {
   promise: Promise<T>;
   cancel: (error: Error) => void;
+}
+
+interface PendingBinaryFileRead {
+  cwd: string;
+  path: string;
+}
+
+interface BinaryFileTransferState extends PendingBinaryFileRead {
+  mime: string;
+  size: number;
+  encoding: Extract<
+    FileTransferFrame,
+    { opcode: typeof FileTransferOpcode.FileBegin }
+  >["metadata"]["encoding"];
+  modifiedAt: string;
+  chunks: Uint8Array[];
 }
 
 type RpcWaitResult<T> = { kind: "ok"; value: T } | { kind: "error"; error: DaemonRpcError };
@@ -610,6 +683,55 @@ function normalizeClientId(value: unknown): string | null {
   }
   const trimmed = value.trim();
   return trimmed.length > 0 ? trimmed : null;
+}
+
+function decodeBase64ToBytes(base64: string): Uint8Array {
+  const binary = globalThis.atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  return bytes;
+}
+
+function legacyExplorerFileToBytes(file: LegacyFileExplorerFilePayload): FileReadResult {
+  let bytes: Uint8Array;
+  if (file.encoding === "base64" && file.content) {
+    bytes = decodeBase64ToBytes(file.content);
+  } else if (file.encoding === "utf-8" && file.content) {
+    bytes = new TextEncoder().encode(file.content);
+  } else {
+    bytes = new Uint8Array();
+  }
+
+  return {
+    bytes,
+    mime: file.mimeType ?? "application/octet-stream",
+    size: file.size,
+    path: file.path,
+    kind: file.kind,
+    modifiedAt: file.modifiedAt,
+  };
+}
+
+function binaryFileKind(mime: string, encoding: string): FileReadResult["kind"] {
+  if (mime.startsWith("image/")) {
+    return "image";
+  }
+  if (encoding === "utf-8" || mime.startsWith("text/") || mime === "application/json") {
+    return "text";
+  }
+  return "binary";
+}
+
+function concatByteChunks(chunks: Uint8Array[], size: number): Uint8Array {
+  const bytes = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return bytes;
 }
 
 function hashForLog(value: string): string {
@@ -680,9 +802,10 @@ export class DaemonClient {
     }
   >();
   private terminalDirectorySubscriptions = new Set<string>();
-  private terminalSlots = new Map<string, number>();
-  private slotTerminals = new Map<number, string>();
-  private readonly terminalStreamListeners = new Set<(event: TerminalStreamEvent) => void>();
+  private readonly terminalStreams = new TerminalStreamRouter();
+  private pendingBinaryFileReads = new Map<string, PendingBinaryFileRead>();
+  private activeBinaryFileTransfers = new Map<string, BinaryFileTransferState>();
+  private completedBinaryFileReads = new Map<string, FileReadResult>();
   private logger: Logger;
   private pendingSendQueue: PendingSend[] = [];
   private readonly logConnectionPath: "direct" | "relay";
@@ -779,9 +902,13 @@ export class DaemonClient {
     }
 
     const headers: Record<string, string> = {};
-    if (this.config.authHeader) {
-      headers["Authorization"] = this.config.authHeader;
+    const password = normalizePassword(this.config.password);
+    if (password) {
+      headers.Authorization = `Bearer ${password}`;
+    } else if (this.config.authHeader) {
+      headers.Authorization = this.config.authHeader;
     }
+    const protocols = password ? [`paseo.bearer.${password}`] : undefined;
 
     try {
       // Reconnect can overlap with browser close/error delivery ordering.
@@ -806,7 +933,11 @@ export class DaemonClient {
         });
       }
       const transportUrl = this.resolveTransportUrlForAttempt();
-      const transport = transportFactory({ url: transportUrl, headers });
+      const transport = transportFactory({
+        url: transportUrl,
+        headers,
+        ...(protocols ? { protocols } : {}),
+      });
       this.transport = transport;
       this.lastServerInfoMessage = null;
 
@@ -945,7 +1076,7 @@ export class DaemonClient {
     this.disposeTransport(1000, "Client closed");
     this.clearWaiters(new Error("Daemon client closed"));
     this.rejectPendingSendQueue(new Error("Daemon client closed"));
-    this.clearTerminalSlots();
+    this.terminalStreams.clearSlots();
     this.lastServerInfoMessage = null;
     if (this.runtimeMetricsInterval) {
       clearInterval(this.runtimeMetricsInterval);
@@ -1028,8 +1159,8 @@ export class DaemonClient {
       return this.subscribe(arg1);
     }
 
-    const type = arg1 as SessionOutboundMessage["type"];
-    const handler = arg2 as (message: SessionOutboundMessage) => void;
+    const type = arg1;
+    const handler = arg2!;
 
     if (!this.messageHandlers.has(type)) {
       this.messageHandlers.set(type, new Set());
@@ -1759,6 +1890,47 @@ export class DaemonClient {
         return null;
       },
     });
+
+    return status.agent;
+  }
+
+  async importAgent(input: ImportAgentInput): Promise<AgentSnapshotPayload> {
+    const requestId = this.createRequestId();
+    const message = SessionInboundMessageSchema.parse({
+      type: "import_agent_request",
+      requestId,
+      provider: input.provider,
+      sessionId: input.sessionId,
+      ...(input.cwd ? { cwd: input.cwd } : {}),
+      ...(input.labels && Object.keys(input.labels).length > 0 ? { labels: input.labels } : {}),
+    });
+
+    const status = await this.sendRequest({
+      requestId,
+      message,
+      timeout: 15000,
+      options: { skipQueue: true },
+      select: (msg) => {
+        if (msg.type !== "status") {
+          return null;
+        }
+        const resumed = AgentResumedStatusPayloadSchema.safeParse(msg.payload);
+        if (resumed.success && resumed.data.requestId === requestId) {
+          return resumed.data;
+        }
+
+        const failed = AgentCreateFailedStatusPayloadSchema.safeParse(msg.payload);
+        if (failed.success && failed.data.requestId === requestId) {
+          return failed.data;
+        }
+
+        return null;
+      },
+    });
+
+    if (status.status === "agent_create_failed") {
+      throw new Error(status.error);
+    }
 
     return status.agent;
   }
@@ -2695,7 +2867,7 @@ export class DaemonClient {
         branchName: input.branchName,
       },
       responseType: "paseo_worktree_archive_response",
-      timeout: 20000,
+      timeout: 60000,
     });
   }
 
@@ -2709,8 +2881,8 @@ export class DaemonClient {
         type: "create_paseo_worktree_request",
         cwd: input.cwd,
         worktreeSlug: input.worktreeSlug,
-        ...(input.attachments && input.attachments.length > 0
-          ? { attachments: input.attachments }
+        ...(input.firstAgentContext !== undefined
+          ? { firstAgentContext: input.firstAgentContext }
           : {}),
         ...(input.refName !== undefined ? { refName: input.refName } : {}),
         ...(input.action !== undefined ? { action: input.action } : {}),
@@ -2801,11 +2973,12 @@ export class DaemonClient {
   // File Explorer
   // ============================================================================
 
-  async exploreFileSystem(
+  private async requestFileExplorer(
     cwd: string,
     path: string,
-    mode: "list" | "file" = "list",
+    mode: "list" | "file",
     requestId?: string,
+    acceptBinary = false,
   ): Promise<FileExplorerPayload> {
     return this.sendCorrelatedSessionRequest({
       requestId,
@@ -2814,10 +2987,49 @@ export class DaemonClient {
         cwd,
         path,
         mode,
+        ...(acceptBinary ? { acceptBinary: true } : {}),
       },
       responseType: "file_explorer_response",
       timeout: 10000,
     });
+  }
+
+  async listDirectory(
+    cwd: string,
+    path: string,
+    requestId?: string,
+  ): Promise<FileExplorerDirectoryPayload> {
+    const payload = await this.requestFileExplorer(cwd, path, "list", requestId);
+    if (payload.error) {
+      throw new Error(payload.error);
+    }
+    if (!payload.directory) {
+      throw new Error("Directory listing unavailable.");
+    }
+    return payload.directory;
+  }
+
+  async readFile(cwd: string, path: string, requestId?: string): Promise<FileReadResult> {
+    const resolvedRequestId = this.createRequestId(requestId);
+    this.pendingBinaryFileReads.set(resolvedRequestId, { cwd, path });
+    try {
+      const payload = await this.requestFileExplorer(cwd, path, "file", resolvedRequestId, true);
+      if (payload.error) {
+        throw new Error(payload.error);
+      }
+      const binaryResult = this.completedBinaryFileReads.get(resolvedRequestId);
+      if (binaryResult) {
+        this.completedBinaryFileReads.delete(resolvedRequestId);
+        return binaryResult;
+      }
+      if (!payload.file) {
+        throw new Error("File unavailable.");
+      }
+      return legacyExplorerFileToBytes(payload.file);
+    } finally {
+      this.pendingBinaryFileReads.delete(resolvedRequestId);
+      this.activeBinaryFileTransfers.delete(resolvedRequestId);
+    }
   }
 
   async requestDownloadToken(
@@ -3300,13 +3512,13 @@ export class DaemonClient {
       options: { skipQueue: true },
     });
     if (payload.error === null) {
-      this.setTerminalSlot(terminalId, payload.slot);
+      this.terminalStreams.setSlot(terminalId, payload.slot);
     }
     return payload;
   }
 
   unsubscribeTerminal(terminalId: string): void {
-    this.removeTerminalSlot(terminalId);
+    this.terminalStreams.removeTerminal(terminalId);
     this.sendSessionMessage({
       type: "unsubscribe_terminal_request",
       terminalId,
@@ -3314,31 +3526,10 @@ export class DaemonClient {
   }
 
   sendTerminalInput(terminalId: string, message: TerminalInput["message"]): void {
-    const slot = this.terminalSlots.get(terminalId);
-    if (typeof slot === "number") {
-      if (message.type === "input") {
-        this.sendBinaryFrame(
-          encodeTerminalStreamFrame({
-            opcode: TerminalStreamOpcode.Input,
-            slot,
-            payload: encodeUtf8String(message.data),
-          }),
-        );
-        return;
-      }
-      if (message.type === "resize") {
-        this.sendBinaryFrame(
-          encodeTerminalStreamFrame({
-            opcode: TerminalStreamOpcode.Resize,
-            slot,
-            payload: encodeTerminalResizePayload({
-              rows: message.rows,
-              cols: message.cols,
-            }),
-          }),
-        );
-        return;
-      }
+    const frame = this.terminalStreams.encodeInput(terminalId, message);
+    if (frame) {
+      this.sendBinaryFrame(frame);
+      return;
     }
     this.sendSessionMessage({
       type: "terminal_input",
@@ -3509,6 +3700,7 @@ export class DaemonClient {
         ...(options.name ? { name: options.name } : {}),
         ...(typeof options.maxRuns === "number" ? { maxRuns: options.maxRuns } : {}),
         ...(options.expiresAt ? { expiresAt: options.expiresAt } : {}),
+        ...(typeof options.runOnCreate === "boolean" ? { runOnCreate: options.runOnCreate } : {}),
       },
       responseType: "schedule/create/response",
       timeout: 10000,
@@ -3586,6 +3778,36 @@ export class DaemonClient {
     });
   }
 
+  async scheduleRunOnce(options: InspectScheduleOptions): Promise<ScheduleRunOncePayload> {
+    return this.sendCorrelatedSessionRequest({
+      requestId: options.requestId,
+      message: {
+        type: "schedule/run-once",
+        scheduleId: options.id,
+      },
+      responseType: "schedule/run-once/response",
+      timeout: 10000,
+    });
+  }
+
+  async scheduleUpdate(options: UpdateScheduleOptions): Promise<ScheduleUpdatePayload> {
+    return this.sendCorrelatedSessionRequest({
+      requestId: options.requestId,
+      message: {
+        type: "schedule/update",
+        scheduleId: options.id,
+        ...(options.name !== undefined ? { name: options.name } : {}),
+        ...(options.prompt !== undefined ? { prompt: options.prompt } : {}),
+        ...(options.cadence !== undefined ? { cadence: options.cadence } : {}),
+        ...(options.newAgentConfig !== undefined ? { newAgentConfig: options.newAgentConfig } : {}),
+        ...(options.maxRuns !== undefined ? { maxRuns: options.maxRuns } : {}),
+        ...(options.expiresAt !== undefined ? { expiresAt: options.expiresAt } : {}),
+      },
+      responseType: "schedule/update/response",
+      timeout: 10000,
+    });
+  }
+
   async loopRun(options: RunLoopOptions): Promise<LoopRunPayload> {
     return this.sendCorrelatedSessionRequest({
       requestId: options.requestId,
@@ -3595,8 +3817,10 @@ export class DaemonClient {
         cwd: options.cwd,
         ...(options.provider ? { provider: options.provider } : {}),
         ...(options.model ? { model: options.model } : {}),
+        ...(options.modeId ? { modeId: options.modeId } : {}),
         ...(options.verifierProvider ? { verifierProvider: options.verifierProvider } : {}),
         ...(options.verifierModel ? { verifierModel: options.verifierModel } : {}),
+        ...(options.verifierModeId ? { verifierModeId: options.verifierModeId } : {}),
         ...(options.verifyPrompt ? { verifyPrompt: options.verifyPrompt } : {}),
         ...(options.verifyChecks && options.verifyChecks.length > 0
           ? { verifyChecks: options.verifyChecks }
@@ -3665,10 +3889,7 @@ export class DaemonClient {
   }
 
   onTerminalStreamEvent(handler: (event: TerminalStreamEvent) => void): () => void {
-    this.terminalStreamListeners.add(handler);
-    return () => {
-      this.terminalStreamListeners.delete(handler);
-    };
+    return this.terminalStreams.onEvent(handler);
   }
 
   async waitForTerminalStreamEvent(
@@ -3700,37 +3921,6 @@ export class DaemonClient {
     return requestId ?? crypto.randomUUID();
   }
 
-  private setTerminalSlot(terminalId: string, slot: number): void {
-    const existingTerminalId = this.slotTerminals.get(slot);
-    if (existingTerminalId && existingTerminalId !== terminalId) {
-      this.terminalSlots.delete(existingTerminalId);
-    }
-
-    const existingSlot = this.terminalSlots.get(terminalId);
-    if (typeof existingSlot === "number" && existingSlot !== slot) {
-      this.slotTerminals.delete(existingSlot);
-    }
-
-    this.terminalSlots.set(terminalId, slot);
-    this.slotTerminals.set(slot, terminalId);
-  }
-
-  private removeTerminalSlot(terminalId: string): void {
-    const slot = this.terminalSlots.get(terminalId);
-    if (typeof slot !== "number") {
-      return;
-    }
-    this.terminalSlots.delete(terminalId);
-    if (this.slotTerminals.get(slot) === terminalId) {
-      this.slotTerminals.delete(slot);
-    }
-  }
-
-  private clearTerminalSlots(): void {
-    this.terminalSlots.clear();
-    this.slotTerminals.clear();
-  }
-
   getLastServerInfoMessage(): ServerInfoStatusPayload | null {
     return this.lastServerInfoMessage;
   }
@@ -3756,6 +3946,9 @@ export class DaemonClient {
           clientId: this.config.clientId,
           clientType: this.config.clientType ?? "cli",
           protocolVersion: 1,
+          capabilities: {
+            [CLIENT_CAPS.reasoningMergeEnum]: true,
+          },
           ...(this.config.appVersion ? { appVersion: this.config.appVersion } : {}),
         }),
       );
@@ -3850,7 +4043,13 @@ export class DaemonClient {
 
     const parsed = WSOutboundMessageSchema.safeParse(parsedJson);
     if (!parsed.success) {
-      const msgType = (parsedJson as { type?: string })?.type ?? "unknown";
+      const msgType =
+        parsedJson != null &&
+        typeof parsedJson === "object" &&
+        "type" in parsedJson &&
+        typeof parsedJson.type === "string"
+          ? parsedJson.type
+          : "unknown";
       this.logger.warn({ msgType, error: parsed.error.message }, "Message validation failed");
       return;
     }
@@ -3869,12 +4068,19 @@ export class DaemonClient {
   }
 
   private tryHandleBinaryFrame(rawBytes: Uint8Array): boolean {
+    const fileFrame = decodeFileTransferFrame(rawBytes);
+    if (fileFrame) {
+      this.handleFileTransferFrame(fileFrame);
+      this.runtimeMetrics?.recordBinaryFrame("other", rawBytes.byteLength, 0);
+      return true;
+    }
+
     const frame = decodeTerminalStreamFrame(rawBytes);
     if (!frame) {
       return false;
     }
     const binaryStartMs = perfNow();
-    this.handleBinaryFrame(frame);
+    this.terminalStreams.handleFrame(frame);
     let frameKind: "output" | "snapshot" | "other" = "other";
     if (frame.opcode === TerminalStreamOpcode.Output) {
       frameKind = "output";
@@ -3889,42 +4095,55 @@ export class DaemonClient {
     return true;
   }
 
-  private handleBinaryFrame(frame: TerminalStreamFrame): void {
-    const terminalId = this.slotTerminals.get(frame.slot);
-    if (!terminalId) {
-      return;
-    }
-
-    if (frame.opcode === TerminalStreamOpcode.Output) {
-      this.emitTerminalStreamEvent({
-        terminalId,
-        type: "output",
-        data: frame.payload,
-      });
-      return;
-    }
-
-    if (frame.opcode === TerminalStreamOpcode.Snapshot) {
-      const state = decodeTerminalSnapshotPayload(frame.payload);
-      if (!state) {
+  private handleFileTransferFrame(frame: FileTransferFrame): void {
+    if (frame.opcode === FileTransferOpcode.FileBegin) {
+      const pending = this.pendingBinaryFileReads.get(frame.requestId);
+      if (!pending) {
         return;
       }
-      this.emitTerminalStreamEvent({
-        terminalId,
-        type: "snapshot",
-        state,
+      this.activeBinaryFileTransfers.set(frame.requestId, {
+        ...pending,
+        mime: frame.metadata.mime,
+        size: frame.metadata.size,
+        encoding: frame.metadata.encoding,
+        modifiedAt: frame.metadata.modifiedAt,
+        chunks: [],
       });
+      return;
     }
-  }
 
-  private emitTerminalStreamEvent(event: TerminalStreamEvent): void {
-    for (const listener of this.terminalStreamListeners) {
-      try {
-        listener(event);
-      } catch {
-        // no-op
-      }
+    const transfer = this.activeBinaryFileTransfers.get(frame.requestId);
+    if (!transfer) {
+      return;
     }
+
+    if (frame.opcode === FileTransferOpcode.FileChunk) {
+      transfer.chunks.push(frame.payload);
+      return;
+    }
+
+    const bytes = concatByteChunks(transfer.chunks, transfer.size);
+    this.activeBinaryFileTransfers.delete(frame.requestId);
+    this.completedBinaryFileReads.set(frame.requestId, {
+      bytes,
+      mime: transfer.mime,
+      size: transfer.size,
+      path: transfer.path,
+      kind: binaryFileKind(transfer.mime, transfer.encoding),
+      modifiedAt: transfer.modifiedAt,
+    });
+    this.handleSessionMessage({
+      type: "file_explorer_response",
+      payload: {
+        cwd: transfer.cwd,
+        path: transfer.path,
+        mode: "file",
+        directory: null,
+        file: null,
+        error: null,
+        requestId: frame.requestId,
+      },
+    });
   }
 
   private updateConnectionState(
@@ -3984,7 +4203,7 @@ export class DaemonClient {
     // and responses from the previous connection will never arrive.
     this.clearWaiters(new Error(reason ?? "Connection lost"));
     this.rejectPendingSendQueue(new Error(reason ?? "Connection lost"));
-    this.clearTerminalSlots();
+    this.terminalStreams.clearSlots();
     this.lastServerInfoMessage = null;
 
     if (wasDisposed) {
@@ -4050,7 +4269,7 @@ export class DaemonClient {
     }
 
     if (msg.type === "terminal_stream_exit") {
-      this.removeTerminalSlot(msg.payload.terminalId);
+      this.terminalStreams.removeTerminal(msg.payload.terminalId);
     }
 
     if (this.rawMessageListeners.size > 0) {
@@ -4192,7 +4411,7 @@ export class DaemonClient {
         timeout > 0
           ? setTimeout(() => {
               if (waiter) {
-                this.waiters.delete(waiter as Waiter<unknown>);
+                this.waiters.delete(waiter);
               }
               wrappedReject(timeoutError);
             }, timeout)
@@ -4204,7 +4423,7 @@ export class DaemonClient {
         reject: wrappedReject,
         timeoutHandle,
       };
-      this.waiters.add(waiter as Waiter<unknown>);
+      this.waiters.add(waiter);
     });
 
     const cancel = (error: Error) => {
@@ -4213,7 +4432,7 @@ export class DaemonClient {
       }
 
       if (waiter) {
-        this.waiters.delete(waiter as Waiter<unknown>);
+        this.waiters.delete(waiter);
         if (waiter.timeoutHandle) {
           clearTimeout(waiter.timeoutHandle);
         }

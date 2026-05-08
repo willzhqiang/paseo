@@ -15,12 +15,17 @@ import {
   type HostConnection,
   type HostProfile,
 } from "@/types/host-connection";
-import { decodeOfferFragmentPayload, normalizeHostPort } from "@/utils/daemon-endpoints";
+import {
+  buildDaemonWebSocketUrl,
+  buildRelayWebSocketUrl,
+  decodeOfferFragmentPayload,
+  normalizeHostPort,
+  shouldUseTlsForDefaultHostedRelay,
+} from "@/utils/daemon-endpoints";
 import { resolveAppVersion } from "@/utils/app-version";
 import { ConnectionOfferSchema, type ConnectionOffer } from "@server/shared/connection-offer";
 import { shouldUseDesktopDaemon } from "@/desktop/daemon/desktop-daemon";
 import { connectToDaemon } from "@/utils/test-daemon-connection";
-import { buildDaemonWebSocketUrl, buildRelayWebSocketUrl } from "@/utils/daemon-endpoints";
 import { getOrCreateClientId } from "@/utils/client-id";
 import {
   selectBestConnection,
@@ -31,7 +36,6 @@ import {
   buildLocalDaemonTransportUrl,
   createDesktopLocalDaemonTransportFactory,
 } from "@/desktop/daemon/desktop-daemon-transport";
-import { isDev } from "@/constants/platform";
 import { replaceFetchedAgentDirectory } from "@/utils/agent-directory-sync";
 import { useSessionStore } from "@/stores/session-store";
 
@@ -115,7 +119,11 @@ export interface HostRuntimeControllerDeps {
     clientId: string;
     runtimeGeneration: number;
   }) => DaemonClient;
-  connectToDaemon: (input: { host: HostProfile; connection: HostConnection }) => Promise<{
+  connectToDaemon: (input: {
+    host: HostProfile;
+    connection: HostConnection;
+    timeoutMs?: number;
+  }) => Promise<{
     client: DaemonClient;
     serverId: string;
     hostname: string | null;
@@ -137,6 +145,7 @@ const PROBE_MAX_BACKOFF_MS = 30_000;
 const ADAPTIVE_SWITCH_THRESHOLD_MS = 40;
 const ADAPTIVE_SWITCH_CONSECUTIVE_PROBES = 3;
 const DEFAULT_AGENT_DIRECTORY_PAGE_LIMIT = 200;
+const CONFIGURED_OVERRIDE_BOOTSTRAP_RETRY_MS = 1_000;
 
 const DEFAULT_AGENT_DIRECTORY_SORT: NonNullable<FetchAgentsOptions["sort"]> = [
   { key: "updated_at", direction: "desc" },
@@ -447,7 +456,6 @@ function createDefaultDeps(): HostRuntimeControllerDeps {
         clientType: "mobile" as const,
         appVersion: resolveAppVersion() ?? undefined,
         runtimeGeneration,
-        ...(isDev ? { runtimeMetricsIntervalMs: 10_000 } : {}),
       };
       if (connection.type === "directSocket" || connection.type === "directPipe") {
         return new DaemonClient({
@@ -462,13 +470,17 @@ function createDefaultDeps(): HostRuntimeControllerDeps {
       if (connection.type === "directTcp") {
         return new DaemonClient({
           ...base,
-          url: buildDaemonWebSocketUrl(connection.endpoint),
+          url: buildDaemonWebSocketUrl(connection.endpoint, {
+            useTls: connection.useTls ?? false,
+          }),
+          ...(connection.password ? { password: connection.password } : {}),
         });
       }
       return new DaemonClient({
         ...base,
         url: buildRelayWebSocketUrl({
           endpoint: connection.relayEndpoint,
+          useTls: connection.useTls ?? shouldUseTlsForDefaultHostedRelay(connection.relayEndpoint),
           serverId: host.serverId,
         }),
         e2ee: {
@@ -477,8 +489,11 @@ function createDefaultDeps(): HostRuntimeControllerDeps {
         },
       });
     },
-    connectToDaemon: ({ host, connection }) =>
-      connectToDaemon(connection, { serverId: host.serverId }),
+    connectToDaemon: ({ host, connection, timeoutMs }) =>
+      connectToDaemon(connection, {
+        ...(host.serverId ? { serverId: host.serverId } : {}),
+        ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+      }),
     getClientId: () => getOrCreateClientId(),
   };
 }
@@ -486,6 +501,7 @@ function createDefaultDeps(): HostRuntimeControllerDeps {
 export class HostRuntimeController {
   private host: HostProfile;
   private deps: HostRuntimeControllerDeps;
+  private onReconcileServerId: ((oldId: string, newId: string) => void) | null;
   private connectionMachineState: HostRuntimeConnectionMachineState;
   private snapshot: HostRuntimeSnapshot;
   private listeners = new Set<() => void>();
@@ -503,9 +519,14 @@ export class HostRuntimeController {
   private probeRequestVersion = 0;
   private probeCycleInFlight: Promise<void> | null = null;
 
-  constructor(input: { host: HostProfile; deps?: HostRuntimeControllerDeps }) {
+  constructor(input: {
+    host: HostProfile;
+    deps?: HostRuntimeControllerDeps;
+    onReconcileServerId?: (oldId: string, newId: string) => void;
+  }) {
     this.host = input.host;
     this.deps = input.deps ?? createDefaultDeps();
+    this.onReconcileServerId = input.onReconcileServerId ?? null;
     this.connectionMachineState = {
       tag: "booting",
     };
@@ -846,10 +867,14 @@ export class HostRuntimeController {
                 connection,
               });
               if (serverId !== this.host.serverId) {
-                await client.close().catch(() => undefined);
-                throw new Error(
-                  `Connection resolved to ${serverId}, expected ${this.host.serverId}.`,
-                );
+                if (isPlaceholderServerId(this.host.serverId) && this.onReconcileServerId) {
+                  this.onReconcileServerId(this.host.serverId, serverId);
+                } else {
+                  await client.close().catch(() => undefined);
+                  throw new Error(
+                    `Connection resolved to ${serverId}, expected ${this.host.serverId}.`,
+                  );
+                }
               }
               connectedClient = client;
               shouldCloseClient = true;
@@ -894,7 +919,7 @@ export class HostRuntimeController {
   private updateSnapshot(patch: HostRuntimeSnapshotPatch): void {
     const preservedPatch: HostRuntimeSnapshotPatch = { ...patch };
     let hasChanged = this.host.serverId !== this.snapshot.serverId;
-    for (const key of Object.keys(patch) as Array<keyof HostRuntimeSnapshotPatch>) {
+    for (const key of Object.keys(patch) as (keyof HostRuntimeSnapshotPatch)[]) {
       const incomingValue = patch[key];
       if (equal(this.snapshot[key], incomingValue)) {
         setSnapshotPatchField(preservedPatch, key, this.snapshot[key]);
@@ -1132,6 +1157,14 @@ export class HostRuntimeController {
     }
   }
 
+  adoptReconciledServerId(newServerId: string): void {
+    this.host = { ...this.host, serverId: newServerId };
+    this.snapshot = { ...this.snapshot, serverId: newServerId };
+    for (const listener of this.listeners) {
+      listener();
+    }
+  }
+
   private resolveClientId(): Promise<string> {
     if (!this.clientIdPromise) {
       this.clientIdPromise = this.deps.getClientId().then((value) => {
@@ -1144,9 +1177,35 @@ export class HostRuntimeController {
 }
 
 const REGISTRY_STORAGE_KEY = "@paseo:daemon-registry";
-const DEFAULT_LOCALHOST_ENDPOINT = process.env.EXPO_PUBLIC_LOCAL_DAEMON?.trim() || "localhost:6767";
+const LOCALHOST_FALLBACK_ENDPOINT = "localhost:6767";
 const DEFAULT_LOCALHOST_BOOTSTRAP_TIMEOUT_MS = 2500;
 const E2E_STORAGE_KEY = "@paseo:e2e";
+
+function readConfiguredLocalDaemonOverride(): string | null {
+  const value = process.env.EXPO_PUBLIC_LOCAL_DAEMON?.trim();
+  return value && value.length > 0 ? value : null;
+}
+
+export function hasConfiguredLocalDaemonOverride(): boolean {
+  return readConfiguredLocalDaemonOverride() !== null;
+}
+
+function isPlaceholderServerId(serverId: string): boolean {
+  return serverId.startsWith("local:");
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function rekeyMap<V>(map: Map<string, V>, oldKey: string, newKey: string): void {
+  const value = map.get(oldKey);
+  if (value === undefined) {
+    return;
+  }
+  map.delete(oldKey);
+  map.set(newKey, value);
+}
 
 export class HostRuntimeStore {
   private controllers = new Map<string, HostRuntimeController>();
@@ -1159,6 +1218,7 @@ export class HostRuntimeStore {
   private deps: HostRuntimeControllerDeps;
   private lastConnectionStatusByServer = new Map<string, HostRuntimeConnectionStatus>();
   private agentDirectoryBootstrapInFlight = new Map<string, Promise<void>>();
+  private configuredOverrideBootstrapInFlight: Promise<void> | null = null;
   private bootStarted = false;
 
   constructor(input?: { deps?: HostRuntimeControllerDeps }) {
@@ -1191,6 +1251,7 @@ export class HostRuntimeStore {
   }
 
   private async runBoot(): Promise<void> {
+    const override = readConfiguredLocalDaemonOverride();
     await this.loadFromStorage();
 
     let isE2E: string | null = null;
@@ -1203,8 +1264,14 @@ export class HostRuntimeStore {
       return;
     }
 
-    if (!shouldUseDesktopDaemon()) {
-      await this.bootstrapLocalhost();
+    if (shouldUseDesktopDaemon()) {
+      return;
+    }
+
+    if (override) {
+      this.bootstrapConfiguredOverride(override);
+    } else {
+      await this.bootstrapDefaultLocalhost();
     }
   }
 
@@ -1218,50 +1285,134 @@ export class HostRuntimeStore {
       if (!Array.isArray(parsed)) {
         return;
       }
-      const profiles = parsed
+      const normalizedProfiles = parsed
         .map((entry) => normalizeStoredHostProfile(entry))
         .filter((entry): entry is HostProfile => entry !== null);
+      const profiles = normalizedProfiles.filter((entry) => !isPlaceholderServerId(entry.serverId));
       this.hosts = profiles;
       this.syncHosts(profiles);
       this.emitHostList();
+      if (profiles.length !== normalizedProfiles.length) {
+        void this.persistHosts();
+      }
     } catch (error) {
       console.error("[HostRuntime] Failed to load host registry from storage", error);
     }
   }
 
-  private async bootstrapLocalhost(): Promise<void> {
-    try {
-      const connection = connectionFromListen(DEFAULT_LOCALHOST_ENDPOINT);
-      if (!connection || registryHasConnection(this.hosts, connection)) {
-        return;
-      }
+  private async bootstrapDefaultLocalhost(): Promise<void> {
+    const connection = connectionFromListen(LOCALHOST_FALLBACK_ENDPOINT);
+    if (!connection || registryHasConnection(this.hosts, connection)) {
+      return;
+    }
 
+    try {
+      await this.probeAndUpsertConnection({
+        connection,
+        timeoutMs: DEFAULT_LOCALHOST_BOOTSTRAP_TIMEOUT_MS,
+      });
+    } catch (error) {
+      console.warn("[HostRuntime] bootstrap probe failed", {
+        endpoint: LOCALHOST_FALLBACK_ENDPOINT,
+        error,
+      });
+    }
+  }
+
+  private bootstrapConfiguredOverride(endpoint: string): void {
+    const connection = connectionFromListen(endpoint);
+    if (!connection) {
+      return;
+    }
+    if (registryHasConnection(this.hosts, connection)) {
+      return;
+    }
+    if (this.configuredOverrideBootstrapInFlight) {
+      return;
+    }
+
+    const bootstrap = this.runConfiguredOverrideBootstrap(endpoint, connection).finally(() => {
+      if (this.configuredOverrideBootstrapInFlight === bootstrap) {
+        this.configuredOverrideBootstrapInFlight = null;
+      }
+    });
+    this.configuredOverrideBootstrapInFlight = bootstrap;
+  }
+
+  private async runConfiguredOverrideBootstrap(
+    endpoint: string,
+    connection: HostConnection,
+  ): Promise<void> {
+    let attempt = 0;
+    while (!registryHasConnection(this.hosts, connection)) {
+      attempt += 1;
       try {
-        const { client, serverId, hostname } = await connectToDaemon(connection, {
+        await this.probeAndUpsertConnection({
+          connection,
           timeoutMs: DEFAULT_LOCALHOST_BOOTSTRAP_TIMEOUT_MS,
         });
-
-        await this.upsertHostConnection({
-          serverId,
-          label: hostname ?? undefined,
-          connection,
-          existingClient: client,
-        });
-      } catch {
-        // Best-effort bootstrap only
+        return;
+      } catch (error) {
+        if (attempt === 1 || attempt % 10 === 0) {
+          console.warn("[HostRuntime] configured bootstrap probe failed", {
+            endpoint,
+            attempt,
+            error,
+          });
+        }
+        await delay(CONFIGURED_OVERRIDE_BOOTSTRAP_RETRY_MS);
       }
-    } catch (error) {
-      console.warn("[HostRuntime] Failed to bootstrap host connections", error);
     }
+  }
+
+  reconcileServerId(oldServerId: string, newServerId: string): void {
+    if (oldServerId === newServerId) {
+      return;
+    }
+    const controller = this.controllers.get(oldServerId);
+    if (!controller) {
+      return;
+    }
+    if (this.controllers.has(newServerId)) {
+      return;
+    }
+
+    rekeyMap(this.controllers, oldServerId, newServerId);
+    controller.adoptReconciledServerId(newServerId);
+
+    rekeyMap(this.lastConnectionStatusByServer, oldServerId, newServerId);
+    rekeyMap(this.agentDirectoryBootstrapInFlight, oldServerId, newServerId);
+
+    const listeners = this.serverListeners.get(oldServerId);
+    if (listeners) {
+      this.serverListeners.delete(oldServerId);
+      const merged = this.serverListeners.get(newServerId) ?? new Set<() => void>();
+      for (const listener of listeners) {
+        merged.add(listener);
+      }
+      this.serverListeners.set(newServerId, merged);
+    }
+
+    this.hosts = this.hosts.map((host) =>
+      host.serverId === oldServerId
+        ? { ...host, serverId: newServerId, updatedAt: new Date().toISOString() }
+        : host,
+    );
+    this.emitHostList();
+    this.emit(newServerId);
+    void this.persistHosts();
   }
 
   async upsertDirectConnection(input: {
     serverId: string;
     endpoint: string;
+    useTls?: boolean;
+    password?: string;
     label?: string;
     existingClient?: DaemonClient;
   }): Promise<HostProfile> {
     const endpoint = normalizeHostPort(input.endpoint);
+    const password = input.password?.trim();
     return this.upsertHostConnection({
       serverId: input.serverId,
       label: input.label,
@@ -1269,29 +1420,86 @@ export class HostRuntimeStore {
         id: `direct:${endpoint}`,
         type: "directTcp",
         endpoint,
+        useTls: input.useTls ?? false,
+        ...(password ? { password } : {}),
       },
       existingClient: input.existingClient,
+    });
+  }
+
+  async probeAndUpsertConnection(input: {
+    connection: HostConnection;
+    label?: string;
+    timeoutMs?: number;
+  }): Promise<{ profile: HostProfile; serverId: string; hostname: string | null }> {
+    if (input.connection.type === "relay") {
+      throw new Error("Cannot probe a relay connection without a server id.");
+    }
+    const probeHost: HostProfile = {
+      serverId: "",
+      label: input.label ?? input.connection.id,
+      lifecycle: {},
+      connections: [input.connection],
+      preferredConnectionId: input.connection.id,
+      createdAt: new Date(0).toISOString(),
+      updatedAt: new Date(0).toISOString(),
+    };
+    const { client, serverId, hostname } = await this.deps.connectToDaemon({
+      host: probeHost,
+      connection: input.connection,
+      ...(input.timeoutMs !== undefined ? { timeoutMs: input.timeoutMs } : {}),
+    });
+    const profile = await this.upsertHostConnection({
+      serverId,
+      label: input.label ?? hostname ?? undefined,
+      connection: input.connection,
+      existingClient: client,
+    });
+    return { profile, serverId, hostname };
+  }
+
+  async probeAndUpsertDirectConnection(input: {
+    endpoint: string;
+    useTls?: boolean;
+    password?: string;
+    label?: string;
+  }): Promise<{ profile: HostProfile; serverId: string; hostname: string | null }> {
+    const endpoint = normalizeHostPort(input.endpoint);
+    const password = input.password?.trim();
+    return this.probeAndUpsertConnection({
+      label: input.label,
+      connection: {
+        id: `direct:${endpoint}`,
+        type: "directTcp",
+        endpoint,
+        useTls: input.useTls ?? false,
+        ...(password ? { password } : {}),
+      },
     });
   }
 
   async upsertRelayConnection(input: {
     serverId: string;
     relayEndpoint: string;
+    useTls?: boolean;
     daemonPublicKeyB64: string;
     label?: string;
   }): Promise<HostProfile> {
     const relayEndpoint = normalizeHostPort(input.relayEndpoint);
+    const useTls = input.useTls ?? false;
     const daemonPublicKeyB64 = input.daemonPublicKeyB64.trim();
     if (!daemonPublicKeyB64) {
       throw new Error("daemonPublicKeyB64 is required");
     }
+    const explicitUseTls = input.useTls !== undefined;
     return this.upsertHostConnection({
       serverId: input.serverId,
       label: input.label,
       connection: {
-        id: `relay:${relayEndpoint}`,
+        id: useTls ? `relay:wss:${relayEndpoint}` : `relay:${relayEndpoint}`,
         type: "relay",
         relayEndpoint,
+        ...(explicitUseTls ? { useTls } : {}),
         daemonPublicKeyB64,
       },
     });
@@ -1301,6 +1509,7 @@ export class HostRuntimeStore {
     return this.upsertRelayConnection({
       serverId: offer.serverId,
       relayEndpoint: offer.relay.endpoint,
+      useTls: offer.relay.useTls,
       daemonPublicKeyB64: offer.daemonPublicKeyB64,
       label,
     });
@@ -1480,6 +1689,7 @@ export class HostRuntimeStore {
       const controller = new HostRuntimeController({
         host,
         deps: this.deps,
+        onReconcileServerId: (oldId, newId) => this.reconcileServerId(oldId, newId),
       });
       this.controllers.set(host.serverId, controller);
       this.lastConnectionStatusByServer.set(
@@ -1838,11 +2048,20 @@ export interface HostMutations {
   upsertDirectConnection: (input: {
     serverId: string;
     endpoint: string;
+    useTls?: boolean;
+    password?: string;
     label?: string;
   }) => Promise<HostProfile>;
+  probeAndUpsertDirectConnection: (input: {
+    endpoint: string;
+    useTls?: boolean;
+    password?: string;
+    label?: string;
+  }) => Promise<{ profile: HostProfile; serverId: string; hostname: string | null }>;
   upsertRelayConnection: (input: {
     serverId: string;
     relayEndpoint: string;
+    useTls?: boolean;
     daemonPublicKeyB64: string;
     label?: string;
   }) => Promise<HostProfile>;
@@ -1861,6 +2080,7 @@ export function useHostMutations(): HostMutations {
   return useMemo(
     () => ({
       upsertDirectConnection: (input) => store.upsertDirectConnection(input),
+      probeAndUpsertDirectConnection: (input) => store.probeAndUpsertDirectConnection(input),
       upsertRelayConnection: (input) => store.upsertRelayConnection(input),
       upsertConnectionFromOffer: (offer, label) => store.upsertConnectionFromOffer(offer, label),
       upsertConnectionFromOfferUrl: (url, label) => store.upsertConnectionFromOfferUrl(url, label),

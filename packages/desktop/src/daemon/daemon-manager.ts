@@ -10,42 +10,38 @@ import {
   garbageCollectManagedAttachmentFiles,
   readManagedFileBase64,
   writeAttachmentBase64,
+  writeAttachmentBytes,
 } from "../features/attachments.js";
 import {
   checkForAppUpdate,
   downloadAndInstallUpdate,
   type AppReleaseChannel,
 } from "../features/auto-updater.js";
+import { getCliInstallStatus, installCli } from "../integrations/cli-install/index.js";
 import {
-  installCli,
-  getCliInstallStatus,
+  getSkillsStatus,
   installSkills,
-  getSkillsInstallStatus,
-} from "../integrations/integrations-manager.js";
+  uninstallSkills,
+  updateSkills,
+} from "../integrations/skills/index.js";
 import {
   openLocalTransportSession,
   sendLocalTransportMessage,
   closeLocalTransportSession,
 } from "./local-transport.js";
-import {
-  createNodeEntrypointInvocation,
-  resolveDaemonRunnerEntrypoint,
-  runCliJsonCommand,
-  runCliTextCommand,
-} from "./runtime-paths.js";
+import { createNodeEntrypointInvocation, resolveDaemonRunnerEntrypoint } from "./runtime-paths.js";
+import { runExternalCliJsonCommand, runExternalCliTextCommand } from "./cli/external.js";
 import {
   createDesktopSettingsCommandHandlers,
   type DesktopCommandHandler,
 } from "../settings/desktop-settings-commands.js";
+import type { DesktopSettings } from "../settings/desktop-settings.js";
 import { getDesktopSettingsStore } from "../settings/desktop-settings-electron.js";
 import { isRunningUnderARM64Translation } from "../system/arm64-translation.js";
 
 const DAEMON_LOG_FILENAME = "daemon.log";
-const PID_POLL_INTERVAL_MS = 100;
 const STARTUP_POLL_INTERVAL_MS = 200;
 const STARTUP_POLL_MAX_ATTEMPTS = 150;
-const STOP_TIMEOUT_MS = 15_000;
-const KILL_TIMEOUT_MS = 3_000;
 const DETACHED_STARTUP_GRACE_MS = 1200;
 
 type DesktopDaemonState = "starting" | "running" | "stopped" | "errored";
@@ -110,7 +106,7 @@ export function isDesktopManagedDaemonRunningSync(): boolean {
 }
 
 export async function stopDesktopDaemonViaCli(): Promise<void> {
-  await runCliJsonCommand([
+  await runExternalCliJsonCommand([
     "daemon",
     "stop",
     "--json",
@@ -134,50 +130,10 @@ function isProcessRunning(pid: number): boolean {
   }
 }
 
-function signalProcessSafely(pid: number, signal: NodeJS.Signals): boolean {
-  if (!Number.isInteger(pid) || pid <= 1 || pid === process.pid) return false;
-  try {
-    process.kill(pid, signal);
-    return true;
-  } catch (err) {
-    if (typeof err === "object" && err !== null && "code" in err) {
-      if (err.code === "ESRCH") return false;
-      if (err.code === "EPERM") return true;
-    }
-    throw err;
-  }
-}
-
-function signalProcessGroupSafely(pid: number, signal: NodeJS.Signals): boolean {
-  if (!Number.isInteger(pid) || pid <= 1 || pid === process.pid) return false;
-  if (process.platform === "win32") return signalProcessSafely(pid, signal);
-  try {
-    process.kill(-pid, signal);
-    return true;
-  } catch (err) {
-    if (typeof err === "object" && err !== null && "code" in err) {
-      if (err.code === "ESRCH") return signalProcessSafely(pid, signal);
-      if (err.code === "EPERM") return true;
-    }
-    throw err;
-  }
-}
-
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => {
     setTimeout(resolve, ms);
   });
-}
-
-async function waitForPidExit(pid: number, timeoutMs: number): Promise<boolean> {
-  const deadline = Date.now() + timeoutMs;
-  async function poll(): Promise<boolean> {
-    if (!isProcessRunning(pid)) return true;
-    if (Date.now() >= deadline) return !isProcessRunning(pid);
-    await sleep(PID_POLL_INTERVAL_MS);
-    return poll();
-  }
-  return poll();
 }
 
 function tailFile(filePath: string, lines = 50): string {
@@ -236,7 +192,7 @@ export async function resolveDesktopDaemonStatus(): Promise<DesktopDaemonStatus>
   const home = getPaseoHome();
 
   try {
-    const payload = (await runCliJsonCommand(["daemon", "status", "--json"])) as Record<
+    const payload = (await runExternalCliJsonCommand(["daemon", "status", "--json"])) as Record<
       string,
       unknown
     >;
@@ -284,6 +240,12 @@ function shouldRestartForVersion(current: DesktopDaemonStatus): boolean {
   return Boolean(appVersion && daemonVersion && appVersion !== daemonVersion);
 }
 
+function assertBuiltInDaemonManagementEnabled(settings: DesktopSettings): void {
+  if (!settings.daemon.manageBuiltInDaemon) {
+    throw new Error("Built-in daemon management is disabled.");
+  }
+}
+
 function buildStartupFailureError(
   result: { code: number | null; signal: string | null; error?: Error },
   stdout: string,
@@ -321,6 +283,8 @@ async function pollForRunningDaemon(): Promise<DesktopDaemonStatus> {
 }
 
 async function startDaemon(): Promise<DesktopDaemonStatus> {
+  assertBuiltInDaemonManagementEnabled(await getDesktopSettingsStore().get());
+
   const current = await resolveDesktopDaemonStatus();
   logDesktopDaemonLifecycle("initial status check before start", {
     status: current.status,
@@ -439,23 +403,12 @@ export async function stopDesktopDaemon(): Promise<DesktopDaemonStatus> {
   const status = await resolveDesktopDaemonStatus();
   if (status.status !== "running" || !status.pid) return status;
 
-  const pid = status.pid;
-  signalProcessSafely(pid, "SIGTERM");
-
-  let stopped = await waitForPidExit(pid, STOP_TIMEOUT_MS);
-  if (!stopped) {
-    signalProcessGroupSafely(pid, "SIGKILL");
-    stopped = await waitForPidExit(pid, KILL_TIMEOUT_MS);
-  }
-
-  if (!stopped) {
-    throw new Error(`Timed out waiting for daemon PID ${pid} to stop`);
-  }
-
+  await stopDesktopDaemonViaCli();
   return await resolveDesktopDaemonStatus();
 }
 
 async function restartDaemon(): Promise<DesktopDaemonStatus> {
+  assertBuiltInDaemonManagementEnabled(await getDesktopSettingsStore().get());
   await stopDesktopDaemon();
   return startDaemon();
 }
@@ -469,7 +422,7 @@ function getDaemonLogs(): DesktopDaemonLogs {
 }
 
 async function getCliDaemonStatus(): Promise<string> {
-  return await runCliTextCommand(["daemon", "status"]);
+  return await runExternalCliTextCommand(["daemon", "status"]);
 }
 
 async function getDaemonPairing(): Promise<DesktopPairingOffer> {
@@ -483,7 +436,7 @@ async function getDaemonPairing(): Promise<DesktopPairingOffer> {
   }
 
   try {
-    const payload = await runCliJsonCommand(["daemon", "pair", "--json"]);
+    const payload = await runExternalCliJsonCommand(["daemon", "pair", "--json"]);
     if (!isRecord(payload)) {
       throw new Error("Daemon pairing response was not an object.");
     }
@@ -539,6 +492,7 @@ export function createDaemonCommandHandlers(): Record<string, DesktopCommandHand
     desktop_get_system_idle_time: () => powerMonitor.getSystemIdleTime() * 1000,
     cli_daemon_status: () => getCliDaemonStatus(),
     write_attachment_base64: (args) => writeAttachmentBase64(args ?? {}),
+    write_attachment_bytes: (args) => writeAttachmentBytes(args ?? {}),
     copy_attachment_file: (args) => copyAttachmentFileToManagedStorage(args ?? {}),
     read_file_base64: (args) => readManagedFileBase64(args ?? {}),
     delete_attachment_file: (args) => deleteManagedAttachmentFile(args ?? {}),
@@ -578,8 +532,10 @@ export function createDaemonCommandHandlers(): Record<string, DesktopCommandHand
     get_local_daemon_version: () => getLocalDaemonVersion(),
     install_cli: () => installCli(),
     get_cli_install_status: () => getCliInstallStatus(),
+    get_skills_status: () => getSkillsStatus(),
     install_skills: () => installSkills(),
-    get_skills_install_status: () => getSkillsInstallStatus(),
+    update_skills: () => updateSkills(),
+    uninstall_skills: () => uninstallSkills(),
   };
 }
 

@@ -9,6 +9,7 @@ import type { FileBackedChatService } from "./chat/chat-service.js";
 import type { LoopService } from "./loop-service.js";
 import type { ScheduleService } from "./schedule/service.js";
 import type { CheckoutDiffManager } from "./checkout-diff-manager.js";
+import { asInternals, createStub } from "./test-utils/class-mocks.js";
 
 const wsModuleMock = vi.hoisted(() => {
   class MockWebSocketServer {
@@ -85,6 +86,15 @@ function createServer(agentManagerOverrides?: Record<string, unknown>) {
     setAgentAttentionCallback: vi.fn(),
     getAgent: vi.fn(() => null),
     getLastAssistantMessage: vi.fn(async () => null),
+    getMetricsSnapshot: vi.fn(() => ({
+      total: 0,
+      byLifecycle: {},
+      withActiveForegroundTurn: 0,
+      timelineStats: {
+        totalItems: 0,
+        maxItemsPerAgent: 0,
+      },
+    })),
     ...agentManagerOverrides,
   };
   const daemonConfigStore = {
@@ -92,16 +102,17 @@ function createServer(agentManagerOverrides?: Record<string, unknown>) {
   };
 
   const server = new VoiceAssistantWebSocketServer(
-    {} as unknown as HTTPServer,
-    createLogger() as unknown as pino.Logger,
+    createStub<HTTPServer>({}),
+    createStub<pino.Logger>(createLogger()),
     "srv-test",
-    agentManager as unknown as AgentManager,
-    {} as unknown as AgentStorage,
-    {} as unknown as DownloadTokenStore,
+    createStub<AgentManager>(agentManager),
+    createStub<AgentStorage>({}),
+    createStub<DownloadTokenStore>({}),
     "/tmp/paseo-test",
-    daemonConfigStore as unknown as DaemonConfigStore,
+    createStub<DaemonConfigStore>(daemonConfigStore),
     null,
     { allowedOrigins: new Set() },
+    undefined,
     undefined,
     undefined,
     undefined,
@@ -112,10 +123,10 @@ function createServer(agentManagerOverrides?: Record<string, unknown>) {
     undefined,
     undefined,
     undefined,
-    {} as unknown as FileBackedChatService,
-    {} as unknown as LoopService,
-    {} as unknown as ScheduleService,
-    {
+    createStub<FileBackedChatService>({}),
+    createStub<LoopService>({}),
+    createStub<ScheduleService>({}),
+    createStub<CheckoutDiffManager>({
       subscribe: vi.fn(),
       scheduleRefreshForCwd: vi.fn(),
       getMetrics: vi.fn(() => ({
@@ -125,7 +136,7 @@ function createServer(agentManagerOverrides?: Record<string, unknown>) {
         checkoutDiffFallbackRefreshTargetCount: 0,
       })),
       dispose: vi.fn(),
-    } as unknown as CheckoutDiffManager,
+    }),
   );
 
   return { server, agentManager };
@@ -166,7 +177,7 @@ function connectClient(
   } | null,
 ) {
   const ws = createOpenSocket();
-  (server as unknown as WebSocketServerInternals).sessions.set(ws, {
+  asInternals<WebSocketServerInternals>(server).sessions.set(ws, {
     session: createSessionWithActivity(activity),
     clientId: "client-test",
     appVersion: null,
@@ -180,7 +191,8 @@ function connectClient(
 function readAttentionRequiredMessage(ws: ReturnType<typeof createOpenSocket>) {
   const rawMessage = ws.send.mock.calls[0]?.[0];
   expect(typeof rawMessage).toBe("string");
-  const message = JSON.parse(rawMessage as string);
+  if (typeof rawMessage !== "string") throw new Error("Expected string WebSocket frame");
+  const message = JSON.parse(rawMessage);
   expect(message.type).toBe("session");
   expect(message.message.type).toBe("agent_stream");
   expect(message.message.payload.event.type).toBe("attention_required");
@@ -205,7 +217,7 @@ describe("VoiceAssistantWebSocketServer notification payloads", () => {
       getLastAssistantMessage,
     });
 
-    await (server as unknown as WebSocketServerInternals).broadcastAgentAttention({
+    await asInternals<WebSocketServerInternals>(server).broadcastAgentAttention({
       agentId: "agent-1",
       provider: "claude",
       reason: "finished",
@@ -235,7 +247,7 @@ describe("VoiceAssistantWebSocketServer notification payloads", () => {
       getLastAssistantMessage,
     });
 
-    await (server as unknown as WebSocketServerInternals).broadcastAgentAttention({
+    await asInternals<WebSocketServerInternals>(server).broadcastAgentAttention({
       agentId: "agent-2",
       provider: "claude",
       reason: "finished",
@@ -261,7 +273,7 @@ describe("VoiceAssistantWebSocketServer notification payloads", () => {
       lastActivityAt: new Date(nowMs - 300_000),
     });
 
-    await (server as unknown as WebSocketServerInternals).broadcastAgentAttention({
+    await asInternals<WebSocketServerInternals>(server).broadcastAgentAttention({
       agentId: "agent-X",
       provider: "claude",
       reason: "finished",
@@ -276,7 +288,7 @@ describe("VoiceAssistantWebSocketServer notification payloads", () => {
     const { server } = createServer();
     const ws = connectClient(server, null);
 
-    await (server as unknown as WebSocketServerInternals).broadcastAgentAttention({
+    await asInternals<WebSocketServerInternals>(server).broadcastAgentAttention({
       agentId: "agent-no-heartbeat",
       provider: "claude",
       reason: "finished",
@@ -290,7 +302,7 @@ describe("VoiceAssistantWebSocketServer notification payloads", () => {
     const { server } = createServer();
     const ws = connectClient(server, null);
 
-    await (server as unknown as WebSocketServerInternals).broadcastAgentAttention({
+    await asInternals<WebSocketServerInternals>(server).broadcastAgentAttention({
       agentId: "agent-no-heartbeat",
       provider: "claude",
       reason: "error",

@@ -53,6 +53,7 @@ import type { MessageInputKeyboardActionKind } from "@/keyboard/actions";
 import { isImeComposingKeyboardEvent } from "@/utils/keyboard-ime";
 import { isWeb } from "@/constants/platform";
 import { useComposerHeightMirror } from "./composer-height-mirror";
+import { computeCanStartDictation } from "./message-input-state";
 
 export type ImageAttachment = AttachmentMetadata;
 
@@ -278,7 +279,7 @@ function VoiceTooltipBody({
   return (
     <View style={styles.tooltipRow}>
       <Text style={styles.tooltipText}>{voiceTooltipText}</Text>
-      {shortcut ? <Shortcut chord={shortcut} style={styles.tooltipShortcut} /> : null}
+      {shortcut ? <Shortcut chord={shortcut} /> : null}
     </View>
   );
 }
@@ -293,7 +294,7 @@ function SendTooltipBody({
   return (
     <View style={styles.tooltipRow}>
       <Text style={styles.tooltipText}>{label}</Text>
-      {sendKeys ? <Shortcut chord={sendKeys} style={styles.tooltipShortcut} /> : null}
+      {sendKeys ? <Shortcut chord={sendKeys} /> : null}
     </View>
   );
 }
@@ -968,19 +969,6 @@ function computeSendableContent(input: SendableContentInput): SendableContentOut
   return { hasAttachments, hasRealContent, hasSendableContent, shouldShowSendButton };
 }
 
-function computeCanStartDictation(input: {
-  client: DaemonClient | null;
-  isReadyForDictation: boolean | undefined;
-  disabled: boolean;
-  dictationUnavailableMessage: string | null | undefined;
-}): boolean {
-  const socketConnected = input.client?.isConnected ?? false;
-  const readyForDictation = input.isReadyForDictation ?? socketConnected;
-  return (
-    socketConnected && readyForDictation && !input.disabled && !input.dictationUnavailableMessage
-  );
-}
-
 function computeIsDictationStartEnabled(
   isReadyForDictation: boolean | undefined,
   isConnected: boolean,
@@ -1328,7 +1316,6 @@ export const MessageInput = forwardRef<MessageInputRef, MessageInputProps>(
       onError: handleDictationError,
       canStart: canStartDictation,
       canConfirm: canConfirmDictation,
-      autoStopWhenHidden: { isVisible: isPaneFocused },
       enableDuration: true,
     });
 
@@ -1924,10 +1911,6 @@ const styles = StyleSheet.create((theme: Theme) => ({
   tooltipText: {
     fontSize: theme.fontSize.sm,
     color: theme.colors.popoverForeground,
-  },
-  tooltipShortcut: {
-    backgroundColor: theme.colors.surface3,
-    borderColor: theme.colors.borderAccent,
   },
   buttonDisabled: {
     opacity: 0.5,

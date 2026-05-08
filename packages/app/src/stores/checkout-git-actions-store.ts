@@ -8,6 +8,14 @@ import {
 import { useSessionStore } from "@/stores/session-store";
 import type { WorkspaceDescriptor } from "@/stores/session-store";
 import { useWorkspaceTabsStore } from "@/stores/workspace-tabs-store";
+import {
+  clearWorkspaceArchivePending,
+  markWorkspaceArchivePending,
+} from "@/contexts/session-workspace-upserts";
+import {
+  resolveWorkspaceIdByExecutionDirectory,
+  resolveWorkspaceMapKeyByIdentity,
+} from "@/utils/workspace-execution";
 
 const SUCCESS_DISPLAY_MS = 1000;
 
@@ -169,10 +177,15 @@ function snapshotWorktreeArchiveState(input: {
   serverId: string;
   worktreePath: string;
 }): WorktreeArchiveSnapshot {
+  const workspaces = useSessionStore.getState().sessions[input.serverId]?.workspaces;
+  const workspaceId =
+    resolveWorkspaceIdByExecutionDirectory({
+      workspaces: workspaces?.values(),
+      workspaceDirectory: input.worktreePath,
+    }) ?? input.worktreePath;
+  const workspaceKey = resolveWorkspaceMapKeyByIdentity({ workspaces, workspaceId });
   return {
-    workspace:
-      useSessionStore.getState().sessions[input.serverId]?.workspaces.get(input.worktreePath) ??
-      null,
+    workspace: workspaceKey ? (workspaces?.get(workspaceKey) ?? null) : null,
     worktreeLists: appQueryClient.getQueriesData({
       predicate: (query) =>
         isWorktreeListQuery({ queryKey: query.queryKey, serverId: input.serverId }),
@@ -191,7 +204,6 @@ function removeWorktreeFromSessionStore(input: { serverId: string; worktreePath:
 
 function restoreWorktreeArchiveState(input: {
   serverId: string;
-  worktreePath: string;
   snapshot: WorktreeArchiveSnapshot;
 }): void {
   if (input.snapshot.workspace) {
@@ -221,6 +233,16 @@ const inFlight = new Map<string, Promise<unknown>>();
 
 function inFlightKey(key: CheckoutKey, actionId: CheckoutGitAsyncActionId): string {
   return `${key}::${actionId}`;
+}
+
+export function isLocalWorktreeArchivePending(input: { serverId: string; cwd: string }): boolean {
+  return (
+    useCheckoutGitActionsStore.getState().getStatus({
+      serverId: input.serverId,
+      cwd: input.cwd,
+      actionId: "archive-worktree",
+    }) === "pending"
+  );
 }
 
 interface CheckoutGitActionsStoreState {
@@ -428,15 +450,27 @@ export const useCheckoutGitActionsStore = create<CheckoutGitActionsStoreState>()
       run: async () => {
         const client = resolveClient(serverId);
         const snapshot = snapshotWorktreeArchiveState({ serverId, worktreePath });
+        markWorkspaceArchivePending({
+          serverId,
+          workspaceId: snapshot.workspace?.id ?? worktreePath,
+          workspaceDirectory: snapshot.workspace?.workspaceDirectory ?? worktreePath,
+        });
         removeWorktreeFromCachedLists({ serverId, worktreePath });
-        removeWorktreeFromSessionStore({ serverId, worktreePath });
+        removeWorktreeFromSessionStore({
+          serverId,
+          worktreePath: snapshot.workspace?.id ?? worktreePath,
+        });
         try {
           const payload = await client.archivePaseoWorktree({ worktreePath });
           if (payload.error) {
             throw new Error(payload.error.message);
           }
         } catch (error) {
-          restoreWorktreeArchiveState({ serverId, worktreePath, snapshot });
+          clearWorkspaceArchivePending({
+            serverId,
+            workspaceId: snapshot.workspace?.id ?? worktreePath,
+          });
+          restoreWorktreeArchiveState({ serverId, snapshot });
           throw error;
         }
         invalidateWorktreeList();

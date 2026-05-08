@@ -6,7 +6,6 @@ import { tmpdir, userInfo } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
-import stripAnsi from "strip-ansi";
 import { createExternalProcessEnv } from "../server/paseo-env.js";
 import type { TerminalCell, TerminalState } from "../shared/messages.js";
 
@@ -27,14 +26,19 @@ export interface TerminalCommandFinishedInfo {
   exitCode: number | null;
 }
 
+export interface TerminalStateSnapshot {
+  state: TerminalState;
+  revision: number;
+}
+
 export type ClientMessage =
   | { type: "input"; data: string }
   | { type: "resize"; rows: number; cols: number }
   | { type: "mouse"; row: number; col: number; button: number; action: "down" | "up" | "move" };
 
 export type ServerMessage =
-  | { type: "output"; data: string }
-  | { type: "snapshot"; state: TerminalState }
+  | { type: "output"; data: string; revision?: number }
+  | { type: "snapshot"; state: TerminalState; revision?: number }
   | { type: "titleChange"; title?: string };
 
 export interface TerminalSession {
@@ -48,6 +52,7 @@ export interface TerminalSession {
   onTitleChange(listener: (title?: string) => void): () => void;
   getSize(): { rows: number; cols: number };
   getState(): TerminalState;
+  getStateSnapshot(): TerminalStateSnapshot;
   getTitle(): string | undefined;
   getExitInfo(): TerminalExitInfo | null;
   kill(): void;
@@ -90,22 +95,15 @@ interface BuildTerminalEnvironmentInput {
   zshShellIntegrationDir?: string;
 }
 
-export interface CaptureTerminalLinesOptions {
-  start?: number;
-  end?: number;
-  stripAnsi?: boolean;
-}
-
-export interface CaptureTerminalLinesResult {
-  lines: string[];
-  totalLines: number;
-}
-
 interface EnsureNodePtySpawnHelperExecutableOptions {
   packageRoot?: string;
   platform?: NodeJS.Platform;
   arch?: string;
   force?: boolean;
+}
+
+interface WindowsPtyProcessReadiness {
+  _agent?: { innerPid?: number };
 }
 
 function resolveNodePtyPackageRoot(): string | null {
@@ -517,63 +515,6 @@ function extractLastOutputLinesFromText(text: string, limit: number): string[] {
   return lines.slice(-limit);
 }
 
-function cellsToPlainText(cells: TerminalCell[], options: { stripAnsi: boolean }): string {
-  const text = cells
-    .map((cell) => cell.char)
-    .join("")
-    .trimEnd();
-  return options.stripAnsi ? stripAnsi(text) : text;
-}
-
-function resolveCaptureLineIndex(
-  lineNumber: number | undefined,
-  totalLines: number,
-  fallback: "start" | "end",
-): number {
-  if (totalLines === 0) {
-    return fallback === "start" ? 0 : -1;
-  }
-
-  const defaultIndex = fallback === "start" ? 0 : totalLines - 1;
-  if (typeof lineNumber !== "number") {
-    return defaultIndex;
-  }
-
-  const resolvedIndex = lineNumber < 0 ? totalLines + lineNumber : lineNumber;
-  if (resolvedIndex < 0) {
-    return 0;
-  }
-  if (resolvedIndex >= totalLines) {
-    return totalLines - 1;
-  }
-  return resolvedIndex;
-}
-
-export function captureTerminalLines(
-  terminal: TerminalSession,
-  options: CaptureTerminalLinesOptions = {},
-): CaptureTerminalLinesResult {
-  const state = terminal.getState();
-  const allLines = [...state.scrollback, ...state.grid].map((cells) =>
-    cellsToPlainText(cells, { stripAnsi: options.stripAnsi ?? true }),
-  );
-  const totalLines = allLines.length;
-  const startIndex = resolveCaptureLineIndex(options.start, totalLines, "start");
-  const endIndex = resolveCaptureLineIndex(options.end, totalLines, "end");
-
-  if (totalLines === 0 || startIndex > endIndex) {
-    return {
-      lines: [],
-      totalLines,
-    };
-  }
-
-  return {
-    lines: allLines.slice(startIndex, endIndex + 1),
-    totalLines,
-  };
-}
-
 export async function createTerminal(options: CreateTerminalOptions): Promise<TerminalSession> {
   const {
     cwd,
@@ -605,6 +546,7 @@ export async function createTerminal(options: CreateTerminalOptions): Promise<Te
   let titleDebounceTimer: ReturnType<typeof setTimeout> | null = null;
   let pendingInput = "";
   let inputFlushImmediate: ReturnType<typeof setImmediate> | null = null;
+  let stateRevision = 0;
 
   // Create xterm.js headless terminal
   const terminal = new Terminal({
@@ -662,6 +604,29 @@ export async function createTerminal(options: CreateTerminalOptions): Promise<Te
       return true;
     }
     return false;
+  });
+  terminal.parser.registerCsiHandler({ final: "n" }, (params) => {
+    if (params.length !== 1) {
+      return false;
+    }
+    if (params[0] === 5) {
+      ptyProcess.write("\x1b[0n");
+      return true;
+    }
+    if (params[0] === 6) {
+      const buffer = terminal.buffer.active;
+      ptyProcess.write(`\x1b[${buffer.cursorY + 1};${buffer.cursorX + 1}R`);
+      return true;
+    }
+    return false;
+  });
+  terminal.parser.registerCsiHandler({ prefix: "?", final: "n" }, (params) => {
+    if (params.length !== 1 || params[0] !== 6) {
+      return false;
+    }
+    const buffer = terminal.buffer.active;
+    ptyProcess.write(`\x1b[?${buffer.cursorY + 1};${buffer.cursorX + 1}R`);
+    return true;
   });
 
   let disposeTitleChangeSubscription: { dispose(): void } | null = null;
@@ -751,6 +716,18 @@ export async function createTerminal(options: CreateTerminalOptions): Promise<Te
     titleChangeListeners.clear();
   }
 
+  function writeOutputToHeadless(data: string): void {
+    terminal.write(data, () => {
+      if (disposed || killed) {
+        return;
+      }
+      stateRevision += 1;
+      for (const listener of listeners) {
+        listener({ type: "output", data, revision: stateRevision });
+      }
+    });
+  }
+
   // Pipe PTY output to terminal emulator
   ptyProcess.onData((data) => {
     if (killed) return;
@@ -758,14 +735,7 @@ export async function createTerminal(options: CreateTerminalOptions): Promise<Te
     if (recentOutputText.length > TERMINAL_EXIT_OUTPUT_CHAR_LIMIT) {
       recentOutputText = recentOutputText.slice(-TERMINAL_EXIT_OUTPUT_CHAR_LIMIT);
     }
-    terminal.write(data, () => {
-      if (disposed || killed) {
-        return;
-      }
-      for (const listener of listeners) {
-        listener({ type: "output", data });
-      }
-    });
+    writeOutputToHeadless(data);
   });
 
   ptyProcess.onExit((event) => {
@@ -788,6 +758,22 @@ export async function createTerminal(options: CreateTerminalOptions): Promise<Te
     disposeResources();
   });
 
+  async function waitForPtyProcessStart(): Promise<void> {
+    if (process.platform !== "win32") {
+      return;
+    }
+
+    const started = (): boolean => {
+      const windowsPtyProcess = ptyProcess as unknown as WindowsPtyProcessReadiness;
+      return ptyProcess.pid > 0 || (windowsPtyProcess._agent?.innerPid ?? 0) > 0 || processExited;
+    };
+
+    const deadline = Date.now() + 5000;
+    while (!started() && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  }
+
   function getState(): TerminalState {
     return {
       rows: terminal.rows,
@@ -796,6 +782,13 @@ export async function createTerminal(options: CreateTerminalOptions): Promise<Te
       scrollback: extractScrollback(terminal),
       cursor: extractCursorState(terminal),
       ...(title ? { title } : {}),
+    };
+  }
+
+  function getStateSnapshot(): TerminalStateSnapshot {
+    return {
+      state: getState(),
+      revision: stateRevision,
     };
   }
 
@@ -846,6 +839,7 @@ export async function createTerminal(options: CreateTerminalOptions): Promise<Te
         flushPendingInput();
         terminal.resize(msg.cols, msg.rows);
         ptyProcess.resize(msg.cols, msg.rows);
+        stateRevision += 1;
         break;
       case "mouse":
         // Mouse events can be sent as escape sequences if terminal supports it
@@ -855,16 +849,36 @@ export async function createTerminal(options: CreateTerminalOptions): Promise<Te
   }
 
   function subscribe(listener: (msg: ServerMessage) => void): () => void {
-    listeners.add(listener);
+    let active = true;
+    let snapshotDelivered = false;
+    const queuedMessages: ServerMessage[] = [];
+    const subscriptionListener = (msg: ServerMessage): void => {
+      if (!active) {
+        return;
+      }
+      if (!snapshotDelivered) {
+        queuedMessages.push(msg);
+        return;
+      }
+      listener(msg);
+    };
+
+    listeners.add(subscriptionListener);
 
     terminal.write("", () => {
-      if (!disposed && listeners.has(listener)) {
-        listener({ type: "snapshot", state: getState() });
+      if (!disposed && active && listeners.has(subscriptionListener)) {
+        snapshotDelivered = true;
+        listener({ type: "snapshot", ...getStateSnapshot() });
+        for (const message of queuedMessages.splice(0)) {
+          listener(message);
+        }
       }
     });
 
     return () => {
-      listeners.delete(listener);
+      active = false;
+      queuedMessages.length = 0;
+      listeners.delete(subscriptionListener);
     };
   }
 
@@ -923,10 +937,24 @@ export async function createTerminal(options: CreateTerminalOptions): Promise<Te
   function kill(): void {
     if (!killed) {
       killed = true;
-      ptyProcess.kill();
+      if (!processExited) {
+        killPtyProcess();
+      }
       emitExit(buildExitInfo());
     }
-    disposeResources();
+    if (processExited) {
+      disposeResources();
+      return;
+    }
+    void waitForProcessExit(1000).finally(disposeResources);
+  }
+
+  function killPtyProcess(signal?: NodeJS.Signals): void {
+    if (process.platform === "win32") {
+      ptyProcess.kill();
+      return;
+    }
+    ptyProcess.kill(signal);
   }
 
   function waitForProcessExit(timeoutMs: number): Promise<boolean> {
@@ -966,7 +994,7 @@ export async function createTerminal(options: CreateTerminalOptions): Promise<Te
     }
 
     try {
-      ptyProcess.kill();
+      killPtyProcess();
     } catch {
       // process may already be gone
     }
@@ -974,7 +1002,7 @@ export async function createTerminal(options: CreateTerminalOptions): Promise<Te
     const exitedGracefully = await waitForProcessExit(gracefulTimeoutMs);
     if (!exitedGracefully) {
       try {
-        ptyProcess.kill("SIGKILL");
+        killPtyProcess("SIGKILL");
       } catch {
         // process may already be gone
       }
@@ -984,6 +1012,8 @@ export async function createTerminal(options: CreateTerminalOptions): Promise<Te
     // Finalize bookkeeping (idempotent if ptyProcess.onExit already fired).
     kill();
   }
+
+  await waitForPtyProcessStart();
 
   // Small delay to let shell initialize
   await new Promise((resolve) => setTimeout(resolve, 50));
@@ -999,6 +1029,7 @@ export async function createTerminal(options: CreateTerminalOptions): Promise<Te
     onTitleChange,
     getSize,
     getState,
+    getStateSnapshot,
     getTitle,
     getExitInfo,
     kill,

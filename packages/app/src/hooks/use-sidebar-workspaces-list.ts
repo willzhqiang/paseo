@@ -11,6 +11,7 @@ import {
 } from "@/stores/session-store-hooks";
 import { getHostRuntimeStore } from "@/runtime/host-runtime";
 import { useSidebarOrderStore } from "@/stores/sidebar-order-store";
+import { shouldSuppressWorkspaceForLocalArchive } from "@/contexts/session-workspace-upserts";
 
 const EMPTY_ORDER: string[] = [];
 const EMPTY_PROJECTS: SidebarProjectEntry[] = [];
@@ -28,6 +29,7 @@ export interface SidebarWorkspaceEntry {
   workspaceKind: WorkspaceDescriptor["workspaceKind"];
   name: string;
   statusBucket: SidebarStateBucket;
+  archivingAt: string | null;
   diffStat: { additions: number; deletions: number } | null;
   scripts: WorkspaceDescriptor["scripts"];
   hasRunningScripts: boolean;
@@ -65,6 +67,7 @@ function createStructuralWorkspaceEntry(input: {
     workspaceKind: "checkout",
     name: input.workspaceId,
     statusBucket: "done",
+    archivingAt: null,
     diffStat: null,
     scripts: [],
     hasRunningScripts: false,
@@ -86,6 +89,7 @@ export function createSidebarWorkspaceEntry(input: {
     workspaceKind: input.workspace.workspaceKind,
     name: input.workspace.name,
     statusBucket: input.workspace.status,
+    archivingAt: input.workspace.archivingAt,
     diffStat: input.workspace.diffStat,
     scripts: input.workspace.scripts,
     hasRunningScripts: input.workspace.scripts.some((script) => script.lifecycle === "running"),
@@ -285,6 +289,9 @@ export function useSidebarWorkspacesList(options?: {
           });
           for (const entry of payload.entries) {
             const workspace = toWorkspaceDescriptor(entry);
+            if (shouldSuppressWorkspaceForLocalArchive({ serverId, workspace })) {
+              continue;
+            }
             next.set(workspace.id, workspace);
           }
           if (!payload.pageInfo.hasMore || !payload.pageInfo.nextCursor) {

@@ -1,3 +1,4 @@
+import fs from "node:fs";
 import path from "node:path";
 import { defineConfig, type UserConfig } from "vite";
 import tsConfigPaths from "vite-tsconfig-paths";
@@ -8,24 +9,59 @@ import tailwindcss from "@tailwindcss/vite";
 
 const repoRoot = path.resolve(__dirname, "../..");
 const siteHost = "https://paseo.sh";
+
+function discoverDocsRoutes(): string[] {
+  const docsDir = path.join(repoRoot, "public-docs");
+  if (!fs.existsSync(docsDir)) return ["/docs"];
+  const routes = new Set<string>(["/docs"]);
+  const walk = (dir: string) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        walk(full);
+        continue;
+      }
+      if (!entry.name.endsWith(".md")) continue;
+      const rel = path.relative(docsDir, full).replace(/\.md$/, "");
+      if (rel === "index") continue;
+      routes.add(`/docs/${rel.split(path.sep).join("/")}`);
+    }
+  };
+  walk(docsDir);
+  return [...routes].sort();
+}
+
+function discoverAgentRoutes(): string[] {
+  const routesDir = path.join(__dirname, "src/routes");
+  const reserved = new Set([
+    "__root",
+    "agents",
+    "blog",
+    "changelog",
+    "cloud",
+    "docs",
+    "download",
+    "index",
+    "privacy",
+  ]);
+  return fs
+    .readdirSync(routesDir, { withFileTypes: true })
+    .filter((entry) => entry.isFile() && entry.name.endsWith(".tsx"))
+    .map((entry) => entry.name.replace(/\.tsx$/, ""))
+    .filter((name) => !reserved.has(name))
+    .sort()
+    .map((slug) => `/${slug}`);
+}
+
 const sitemapPages = [
   "/",
+  "/agents",
   "/changelog",
-  "/claude-code",
-  "/codex",
-  "/docs",
+  "/cloud",
   "/download",
-  "/opencode",
   "/privacy",
-  "/docs/best-practices",
-  "/docs/cli",
-  "/docs/configuration",
-  "/docs/providers",
-  "/docs/skills",
-  "/docs/security",
-  "/docs/updates",
-  "/docs/voice",
-  "/docs/worktrees",
+  ...discoverAgentRoutes(),
+  ...discoverDocsRoutes(),
 ].map((routePath) => ({
   path: routePath,
 }));
@@ -33,9 +69,14 @@ const sitemapPages = [
 export default defineConfig((): UserConfig => {
   return {
     server: {
+      host: "0.0.0.0",
       port: 8082,
+      strictPort: false,
       fs: {
         allow: [repoRoot],
+      },
+      watch: {
+        ignored: ["**/.tanstack/**"],
       },
     },
     plugins: [

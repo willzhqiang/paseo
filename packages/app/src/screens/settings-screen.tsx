@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useState, useSyncExternalStore } from "react";
+import { Fragment, useCallback, useMemo, useState, useSyncExternalStore } from "react";
 import type { ComponentType, ReactNode } from "react";
 import {
   Alert,
@@ -39,6 +39,7 @@ import {
   useSettings,
   type AppSettings,
   type SendBehavior,
+  type ServiceUrlBehavior,
   type Settings as EffectiveSettings,
 } from "@/hooks/use-settings";
 import { THEME_SWATCHES } from "@/styles/theme";
@@ -77,13 +78,12 @@ import { useIsCompactFormFactor } from "@/constants/layout";
 import { useLocalDaemonServerId } from "@/hooks/use-is-local-daemon";
 import {
   buildHostOpenProjectRoute,
-  buildHostWorkspaceRoute,
   buildProjectsSettingsRoute,
   buildSettingsHostRoute,
   buildSettingsSectionRoute,
   type SettingsSectionSlug,
 } from "@/utils/host-routes";
-import { getLastNavigationWorkspaceRouteSelection } from "@/stores/navigation-active-workspace-store";
+import { navigateToLastWorkspace } from "@/stores/navigation-active-workspace-store";
 
 // ---------------------------------------------------------------------------
 // View model
@@ -190,14 +190,24 @@ const RELEASE_CHANNEL_OPTIONS = [
   { value: "beta" as const, label: "Beta" },
 ];
 
+const SERVICE_URL_BEHAVIOR_LABELS: Record<ServiceUrlBehavior, string> = {
+  ask: "Ask",
+  "in-app": "In Paseo",
+  external: "External browser",
+};
+
+const SERVICE_URL_BEHAVIOR_VALUES: ServiceUrlBehavior[] = ["ask", "in-app", "external"];
+
 // ---------------------------------------------------------------------------
 // Section components
 // ---------------------------------------------------------------------------
 
 interface GeneralSectionProps {
   settings: AppSettings;
+  isDesktopApp: boolean;
   handleThemeChange: (theme: AppSettings["theme"]) => void;
   handleSendBehaviorChange: (behavior: SendBehavior) => void;
+  handleServiceUrlBehaviorChange: (behavior: ServiceUrlBehavior) => void;
 }
 
 interface ThemeMenuItemProps {
@@ -229,10 +239,33 @@ function ThemeMenuItem({
   );
 }
 
+interface ServiceUrlBehaviorMenuItemProps {
+  value: ServiceUrlBehavior;
+  selected: boolean;
+  onChange: (value: ServiceUrlBehavior) => void;
+}
+
+function ServiceUrlBehaviorMenuItem({
+  value,
+  selected,
+  onChange,
+}: ServiceUrlBehaviorMenuItemProps) {
+  const handleSelect = useCallback(() => {
+    onChange(value);
+  }, [onChange, value]);
+  return (
+    <DropdownMenuItem selected={selected} onSelect={handleSelect}>
+      {SERVICE_URL_BEHAVIOR_LABELS[value]}
+    </DropdownMenuItem>
+  );
+}
+
 function GeneralSection({
   settings,
+  isDesktopApp,
   handleThemeChange,
   handleSendBehaviorChange,
+  handleServiceUrlBehaviorChange,
 }: GeneralSectionProps) {
   const { theme } = useUnistyles();
   const iconSize = theme.iconSize.md;
@@ -290,6 +323,32 @@ function GeneralSection({
             options={SEND_BEHAVIOR_OPTIONS}
           />
         </View>
+        {isDesktopApp ? (
+          <View style={ROW_WITH_BORDER_STYLE}>
+            <View style={settingsStyles.rowContent}>
+              <Text style={settingsStyles.rowTitle}>Service URLs</Text>
+              <Text style={settingsStyles.rowHint}>Where to open URLs from running scripts</Text>
+            </View>
+            <DropdownMenu>
+              <DropdownMenuTrigger style={themeTriggerStyle}>
+                <Text style={styles.themeTriggerText}>
+                  {SERVICE_URL_BEHAVIOR_LABELS[settings.serviceUrlBehavior]}
+                </Text>
+                <ChevronDown size={theme.iconSize.sm} color={iconColor} />
+              </DropdownMenuTrigger>
+              <DropdownMenuContent side="bottom" align="end" width={200}>
+                {SERVICE_URL_BEHAVIOR_VALUES.map((value) => (
+                  <ServiceUrlBehaviorMenuItem
+                    key={value}
+                    value={value}
+                    selected={settings.serviceUrlBehavior === value}
+                    onChange={handleServiceUrlBehaviorChange}
+                  />
+                ))}
+              </DropdownMenuContent>
+            </DropdownMenu>
+          </View>
+        ) : null}
       </View>
     </SettingsSection>
   );
@@ -686,16 +745,19 @@ function SettingsSidebar({
       ) : null}
       <View style={sidebarStyles.list}>
         {items.map((item) => (
-          <SidebarSectionButton
-            key={item.id}
-            itemId={item.id}
-            label={item.label}
-            icon={item.icon}
-            isSelected={selectedSectionId === item.id}
-            onSelect={onSelectSection}
-          />
+          <Fragment key={item.id}>
+            <SidebarSectionButton
+              itemId={item.id}
+              label={item.label}
+              icon={item.icon}
+              isSelected={selectedSectionId === item.id}
+              onSelect={onSelectSection}
+            />
+            {item.id === "general" ? (
+              <SidebarProjectsButton isSelected={isProjectsSelected} onSelect={onSelectProjects} />
+            ) : null}
+          </Fragment>
         ))}
-        <SidebarProjectsButton isSelected={isProjectsSelected} onSelect={onSelectProjects} />
       </View>
       <SidebarSeparator />
       <View style={sidebarStyles.list}>
@@ -764,6 +826,13 @@ export default function SettingsScreen({ view }: SettingsScreenProps) {
   const handleSendBehaviorChange = useCallback(
     (behavior: SendBehavior) => {
       void updateSettings({ sendBehavior: behavior });
+    },
+    [updateSettings],
+  );
+
+  const handleServiceUrlBehaviorChange = useCallback(
+    (behavior: ServiceUrlBehavior) => {
+      void updateSettings({ serviceUrlBehavior: behavior });
     },
     [updateSettings],
   );
@@ -894,11 +963,7 @@ export default function SettingsScreen({ view }: SettingsScreenProps) {
   }, [router]);
 
   const handleBackToWorkspace = useCallback(() => {
-    const lastWorkspaceRoute = getLastNavigationWorkspaceRouteSelection();
-    if (lastWorkspaceRoute) {
-      router.replace(
-        buildHostWorkspaceRoute(lastWorkspaceRoute.serverId, lastWorkspaceRoute.workspaceId),
-      );
+    if (navigateToLastWorkspace()) {
       return;
     }
     if (anyOnlineServerId) {
@@ -949,8 +1014,10 @@ export default function SettingsScreen({ view }: SettingsScreenProps) {
           return (
             <GeneralSection
               settings={settings}
+              isDesktopApp={isDesktopApp}
               handleThemeChange={handleThemeChange}
               handleSendBehaviorChange={handleSendBehaviorChange}
+              handleServiceUrlBehaviorChange={handleServiceUrlBehaviorChange}
             />
           );
         case "shortcuts":

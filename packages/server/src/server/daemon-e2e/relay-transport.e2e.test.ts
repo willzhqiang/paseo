@@ -11,6 +11,8 @@ import { generateLocalPairingOffer } from "../pairing-offer.js";
 import { createTestPaseoDaemon } from "../test-utils/paseo-daemon.js";
 import { createClientChannel, type Transport } from "@getpaseo/relay/e2ee";
 import { buildRelayWebSocketUrl } from "../../shared/daemon-endpoints.js";
+import { ConnectionOfferSchema } from "../../shared/connection-offer.js";
+import { WSOutboundMessageSchema } from "../../shared/messages.js";
 
 const nodeMajor = Number((process.versions.node ?? "0").split(".")[0] ?? "0");
 const shouldRunRelayE2e = process.env.FORCE_RELAY_E2E === "1" || nodeMajor < 25;
@@ -59,10 +61,7 @@ function decodeOfferFromFragmentUrl(url: string): {
   }
   const encoded = url.slice(idx + marker.length);
   const json = Buffer.from(encoded, "base64url").toString("utf8");
-  const offer = JSON.parse(json) as { v?: unknown; serverId?: string; daemonPublicKeyB64?: string };
-  if (offer.v !== 2) throw new Error("expected offer.v=2");
-  if (!offer.serverId) throw new Error("offer.serverId missing");
-  if (!offer.daemonPublicKeyB64) throw new Error("offer.daemonPublicKeyB64 missing");
+  const offer = ConnectionOfferSchema.parse(JSON.parse(json));
   return { serverId: offer.serverId, daemonPublicKeyB64: offer.daemonPublicKeyB64 };
 }
 
@@ -106,6 +105,7 @@ async function waitForRelayWebSocketReady(port: number, timeout = 60000): Promis
     const serverId = `probe-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
     const url = buildRelayWebSocketUrl({
       endpoint: `127.0.0.1:${port}`,
+      useTls: false,
       serverId,
       role: "server",
     });
@@ -225,6 +225,7 @@ async function waitForRelayWebSocketReady(port: number, timeout = 60000): Promis
       const ws = new WebSocket(
         buildRelayWebSocketUrl({
           endpoint: `127.0.0.1:${relayPort}`,
+          useTls: false,
           serverId,
           role: "client",
         }),
@@ -280,27 +281,12 @@ async function waitForRelayWebSocketReady(port: number, timeout = 60000): Promis
               onmessage: (data) => {
                 try {
                   const payload = typeof data === "string" ? JSON.parse(data) : data;
+                  const wsMsg = WSOutboundMessageSchema.safeParse(payload);
                   if (
-                    payload &&
-                    typeof payload === "object" &&
-                    (
-                      payload as {
-                        type?: string;
-                        message?: { type?: string; payload?: { status?: string } };
-                      }
-                    ).type === "session" &&
-                    (
-                      payload as {
-                        type?: string;
-                        message?: { type?: string; payload?: { status?: string } };
-                      }
-                    ).message?.type === "status" &&
-                    (
-                      payload as {
-                        type?: string;
-                        message?: { type?: string; payload?: { status?: string } };
-                      }
-                    ).message?.payload?.status === "server_info"
+                    wsMsg.success &&
+                    wsMsg.data.type === "session" &&
+                    wsMsg.data.message.type === "status" &&
+                    wsMsg.data.message.payload?.status === "server_info"
                   ) {
                     if (!pingSent && channelRef) {
                       pingSent = true;
@@ -308,17 +294,8 @@ async function waitForRelayWebSocketReady(port: number, timeout = 60000): Promis
                     }
                     return;
                   }
-                  if (
-                    payload &&
-                    typeof payload === "object" &&
-                    (
-                      payload as {
-                        type?: string;
-                        message?: { type?: string; payload?: { status?: string } };
-                      }
-                    ).type === "pong"
-                  ) {
-                    settleResolve(payload);
+                  if (wsMsg.success && wsMsg.data.type === "pong") {
+                    settleResolve(wsMsg.data);
                     ws.close();
                   }
                 } catch (err) {
@@ -392,6 +369,7 @@ async function waitForRelayWebSocketReady(port: number, timeout = 60000): Promis
       const ws = new WebSocket(
         buildRelayWebSocketUrl({
           endpoint: `127.0.0.1:${relayPort}`,
+          useTls: false,
           serverId,
           role: "client",
         }),
@@ -429,27 +407,12 @@ async function waitForRelayWebSocketReady(port: number, timeout = 60000): Promis
             const channel = await createClientChannel(transport, daemonPublicKeyB64, {
               onmessage: (data) => {
                 const payload = typeof data === "string" ? JSON.parse(data) : data;
+                const wsMsg = WSOutboundMessageSchema.safeParse(payload);
                 if (
-                  payload &&
-                  typeof payload === "object" &&
-                  (
-                    payload as {
-                      type?: string;
-                      message?: { type?: string; payload?: { status?: string } };
-                    }
-                  ).type === "session" &&
-                  (
-                    payload as {
-                      type?: string;
-                      message?: { type?: string; payload?: { status?: string } };
-                    }
-                  ).message?.type === "status" &&
-                  (
-                    payload as {
-                      type?: string;
-                      message?: { type?: string; payload?: { status?: string } };
-                    }
-                  ).message?.payload?.status === "server_info"
+                  wsMsg.success &&
+                  wsMsg.data.type === "session" &&
+                  wsMsg.data.message.type === "status" &&
+                  wsMsg.data.message.payload?.status === "server_info"
                 ) {
                   if (!pingSent && channelRef) {
                     pingSent = true;
@@ -457,18 +420,9 @@ async function waitForRelayWebSocketReady(port: number, timeout = 60000): Promis
                   }
                   return;
                 }
-                if (
-                  payload &&
-                  typeof payload === "object" &&
-                  (
-                    payload as {
-                      type?: string;
-                      message?: { type?: string; payload?: { status?: string } };
-                    }
-                  ).type === "pong"
-                ) {
+                if (wsMsg.success && wsMsg.data.type === "pong") {
                   clearTimeout(timeout);
-                  resolve(payload);
+                  resolve(wsMsg.data);
                   ws.close();
                 }
               },

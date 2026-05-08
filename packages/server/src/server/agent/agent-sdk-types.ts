@@ -235,8 +235,9 @@ export type ToolCallDetail =
       type: "sub_agent";
       subAgentType?: string;
       description?: string;
+      childSessionId?: string;
       log: string;
-      actions: Array<{
+      actions?: Array<{
         index: number;
         toolName: string;
         summary?: string;
@@ -254,8 +255,8 @@ export type ToolCallDetail =
     }
   | {
       type: "unknown";
-      input: unknown | null;
-      output: unknown | null;
+      input: unknown;
+      output: unknown;
     };
 
 interface ToolCallBase {
@@ -315,6 +316,18 @@ export type AgentStreamEvent =
   | { type: "turn_started"; provider: AgentProvider; turnId?: string }
   | { type: "turn_completed"; provider: AgentProvider; usage?: AgentUsage; turnId?: string }
   | { type: "usage_updated"; provider: AgentProvider; usage: AgentUsage; turnId?: string }
+  | {
+      type: "mode_changed";
+      provider: AgentProvider;
+      currentModeId: string | null;
+      availableModes: AgentMode[];
+    }
+  | { type: "model_changed"; provider: AgentProvider; runtimeInfo: AgentRuntimeInfo }
+  | {
+      type: "thinking_option_changed";
+      provider: AgentProvider;
+      thinkingOptionId: string | null;
+    }
   | {
       type: "turn_failed";
       provider: AgentProvider;
@@ -459,6 +472,14 @@ export interface AgentLaunchContext {
   env?: Record<string, string>;
 }
 
+export interface AgentCreateSessionOptions {
+  /**
+   * Whether the provider should leave a durable native session behind.
+   * Defaults to true. Providers that cannot honor false should no-op.
+   */
+  persistSession?: boolean;
+}
+
 /**
  * Returned by respondToPermission when the permission resolution requires
  * a follow-up turn (e.g. Codex plan approval → implementation).
@@ -492,6 +513,17 @@ export interface AgentSession {
   setModel?(modelId: string | null): Promise<void>;
   setThinkingOption?(thinkingOptionId: string | null): Promise<void>;
   setFeature?(featureId: string, value: unknown): Promise<void>;
+  /**
+   * Out-of-band prompt handler. When non-null, the manager runs the returned
+   * handler instead of allocating a turn. The handler emits stream events
+   * directly via the provided `emit` callback, which routes through the
+   * manager's persistence + broadcast pipeline. The active foreground turn
+   * (if any) is left untouched, so this is how mid-turn side-effect commands
+   * (e.g. /goal pause) reach the provider without canceling the running turn.
+   */
+  tryHandleOutOfBand?(prompt: AgentPromptInput): {
+    run(ctx: { emit: (event: AgentStreamEvent) => void }): Promise<void>;
+  } | null;
 }
 
 export interface ListModelsOptions {
@@ -510,6 +542,7 @@ export interface AgentClient {
   createSession(
     config: AgentSessionConfig,
     launchContext?: AgentLaunchContext,
+    options?: AgentCreateSessionOptions,
   ): Promise<AgentSession>;
   resumeSession(
     handle: AgentPersistenceHandle,

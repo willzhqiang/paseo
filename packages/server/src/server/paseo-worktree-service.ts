@@ -12,10 +12,18 @@ import {
   type CreateWorktreeCoreDeps,
   type CreateWorktreeCoreInput,
 } from "./worktree-core.js";
-import type { WorktreeConfig } from "../utils/worktree.js";
+import { validateBranchSlug, type WorktreeConfig } from "../utils/worktree.js";
+import { getCurrentBranch, renameCurrentBranch } from "../utils/checkout-git.js";
+import {
+  markPaseoWorktreeFirstAgentBranchAutoNameAttempted,
+  readPaseoWorktreeMetadata,
+  writePaseoWorktreeFirstAgentBranchAutoNameMetadata,
+} from "../utils/worktree-metadata.js";
 import type { WorktreeCreationIntent } from "./resolve-worktree-creation-intent.js";
+import { buildAgentBranchNameSeed } from "./agent/prompt-attachments.js";
+import type { FirstAgentContext } from "../shared/messages.js";
 
-export interface CreatePaseoWorktreeInput extends CreateWorktreeCoreInput {}
+export type CreatePaseoWorktreeInput = CreateWorktreeCoreInput;
 
 export interface CreatePaseoWorktreeResult {
   worktree: WorktreeConfig;
@@ -32,6 +40,12 @@ export type CreatePaseoWorktreeFn = (
   },
 ) => Promise<CreatePaseoWorktreeResult>;
 
+export interface AttemptFirstAgentBranchAutoNameResult {
+  attempted: boolean;
+  renamed: boolean;
+  branchName: string | null;
+}
+
 export interface CreatePaseoWorktreeDeps extends CreateWorktreeCoreDeps {
   projectRegistry: Pick<ProjectRegistry, "get" | "upsert">;
   workspaceRegistry: Pick<WorkspaceRegistry, "get" | "list" | "upsert">;
@@ -43,6 +57,7 @@ export async function createPaseoWorktree(
   deps: CreatePaseoWorktreeDeps,
 ): Promise<CreatePaseoWorktreeResult> {
   const createdWorktree = await createWorktreeCore(input, deps);
+  maybeMarkFirstAgentBranchAutoNameEligible({ createdWorktree });
   const workspace = await upsertWorkspaceForWorktree({
     inputCwd: input.cwd,
     repoRoot: createdWorktree.repoRoot,
@@ -59,6 +74,81 @@ export async function createPaseoWorktree(
     repoRoot: createdWorktree.repoRoot,
     created: createdWorktree.created,
   };
+}
+
+export async function attemptFirstAgentBranchAutoName(options: {
+  cwd: string;
+  firstAgentContext: FirstAgentContext | undefined;
+  generateBranchNameFromContext: (input: {
+    cwd: string;
+    firstAgentContext: FirstAgentContext;
+  }) => Promise<string | null>;
+  getCurrentBranch?: typeof getCurrentBranch;
+  renameCurrentBranch?: typeof renameCurrentBranch;
+}): Promise<AttemptFirstAgentBranchAutoNameResult> {
+  const firstAgentContext = options.firstAgentContext;
+  if (!firstAgentContext || !buildAgentBranchNameSeed(firstAgentContext)) {
+    return { attempted: false, renamed: false, branchName: null };
+  }
+
+  let metadata: ReturnType<typeof readPaseoWorktreeMetadata>;
+  try {
+    metadata = readPaseoWorktreeMetadata(options.cwd);
+  } catch {
+    return { attempted: false, renamed: false, branchName: null };
+  }
+  if (
+    !metadata ||
+    metadata.version !== 2 ||
+    metadata.firstAgentBranchAutoName?.status !== "pending"
+  ) {
+    return { attempted: false, renamed: false, branchName: null };
+  }
+
+  const getCurrentBranchImpl = options.getCurrentBranch ?? getCurrentBranch;
+  const placeholderBranchName = metadata.firstAgentBranchAutoName.placeholderBranchName;
+  if ((await getCurrentBranchImpl(options.cwd)) !== placeholderBranchName) {
+    markPaseoWorktreeFirstAgentBranchAutoNameAttempted(options.cwd);
+    return { attempted: true, renamed: false, branchName: null };
+  }
+
+  markPaseoWorktreeFirstAgentBranchAutoNameAttempted(options.cwd);
+
+  const branchName = await options.generateBranchNameFromContext({
+    cwd: options.cwd,
+    firstAgentContext,
+  });
+  if (!branchName) {
+    return { attempted: true, renamed: false, branchName: null };
+  }
+  const validation = validateBranchSlug(branchName);
+  if (!validation.valid || branchName === placeholderBranchName) {
+    return { attempted: true, renamed: false, branchName: null };
+  }
+  if ((await getCurrentBranchImpl(options.cwd)) !== placeholderBranchName) {
+    return { attempted: true, renamed: false, branchName: null };
+  }
+
+  const renameCurrentBranchImpl = options.renameCurrentBranch ?? renameCurrentBranch;
+  const renamedBranch = await renameCurrentBranchImpl(options.cwd, branchName);
+  return {
+    attempted: true,
+    renamed: true,
+    branchName: renamedBranch.currentBranch ?? branchName,
+  };
+}
+
+function maybeMarkFirstAgentBranchAutoNameEligible(options: {
+  createdWorktree: Awaited<ReturnType<typeof createWorktreeCore>>;
+}): void {
+  const { createdWorktree } = options;
+  if (!createdWorktree.created || createdWorktree.intent.kind !== "branch-off") {
+    return;
+  }
+
+  writePaseoWorktreeFirstAgentBranchAutoNameMetadata(createdWorktree.worktree.worktreePath, {
+    placeholderBranchName: createdWorktree.worktree.branchName,
+  });
 }
 
 async function upsertWorkspaceForWorktree(options: {

@@ -3,12 +3,15 @@ import type { DaemonClientConfig } from "@server/client/daemon-client";
 import type { HostConnection } from "@/types/host-connection";
 import { getOrCreateClientId } from "./client-id";
 import { resolveAppVersion } from "./app-version";
-import { buildDaemonWebSocketUrl, buildRelayWebSocketUrl } from "./daemon-endpoints";
+import {
+  buildDaemonWebSocketUrl,
+  buildRelayWebSocketUrl,
+  shouldUseTlsForDefaultHostedRelay,
+} from "./daemon-endpoints";
 import {
   buildLocalDaemonTransportUrl,
   createDesktopLocalDaemonTransportFactory,
 } from "@/desktop/daemon/desktop-daemon-transport";
-import { isDev } from "@/constants/platform";
 
 function normalizeNonEmptyString(value: unknown): string | null {
   if (typeof value !== "string") return null;
@@ -32,6 +35,23 @@ function pickBestReason(reason: string | null, lastError: string | null): string
   if (reason) return reason;
   if (lastError) return lastError;
   return "Unable to connect";
+}
+
+function isIncorrectPasswordFailure(input: {
+  config: DaemonClientConfig;
+  reason: string | null;
+  lastError: string | null;
+}): boolean {
+  if (!input.config.password) {
+    return false;
+  }
+  const details = [input.reason, input.lastError].filter(Boolean).join("\n").toLowerCase();
+  return (
+    details.includes("401") ||
+    details.includes("4001") ||
+    details.includes("unauthorized") ||
+    details.includes("code 1006")
+  );
 }
 
 export class DaemonConnectionTestError extends Error {
@@ -58,7 +78,6 @@ export async function buildClientConfig(
     appVersion: resolveAppVersion() ?? undefined,
     suppressSendErrors: true,
     reconnect: { enabled: false },
-    ...(isDev ? { runtimeMetricsIntervalMs: 10_000 } : {}),
     ...((connection.type === "directSocket" || connection.type === "directPipe") &&
     localTransportFactory
       ? { transportFactory: localTransportFactory }
@@ -78,7 +97,8 @@ export async function buildClientConfig(
   if (connection.type === "directTcp") {
     return {
       ...base,
-      url: buildDaemonWebSocketUrl(connection.endpoint),
+      url: buildDaemonWebSocketUrl(connection.endpoint, { useTls: connection.useTls ?? false }),
+      ...(connection.password ? { password: connection.password } : {}),
     };
   }
 
@@ -90,6 +110,7 @@ export async function buildClientConfig(
     ...base,
     url: buildRelayWebSocketUrl({
       endpoint: connection.relayEndpoint,
+      useTls: connection.useTls ?? shouldUseTlsForDefaultHostedRelay(connection.relayEndpoint),
       serverId,
     }),
     e2ee: { enabled: true, daemonPublicKeyB64: connection.daemonPublicKeyB64 },
@@ -142,7 +163,9 @@ export function connectAndProbe(
             error instanceof Error ? error.message : String(error),
           );
           const lastError = normalizeNonEmptyString(client.lastError);
-          const message = pickBestReason(reason, lastError);
+          const message = isIncorrectPasswordFailure({ config, reason, lastError })
+            ? "Incorrect password"
+            : pickBestReason(reason, lastError);
           void client.close().catch(() => undefined);
           reject(new DaemonConnectionTestError(message, { reason, lastError }));
         });
