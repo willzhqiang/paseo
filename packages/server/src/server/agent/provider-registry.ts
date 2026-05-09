@@ -120,6 +120,19 @@ function toRuntimeSettings(override?: ProviderOverride): ProviderRuntimeSettings
     return undefined;
   }
 
+  /* [local/custom-display] Expand ${VAR} references in env values from process.env */
+  let env = override.env;
+  if (env) {
+    env = Object.fromEntries(
+      Object.entries(env).map(([key, value]) => [
+        key,
+        value.includes("${")
+          ? value.replace(/\$\{([^}]+)\}/g, (_, name) => process.env[name] ?? "")
+          : value,
+      ]),
+    );
+  }
+
   return {
     command: override.command
       ? {
@@ -127,7 +140,7 @@ function toRuntimeSettings(override?: ProviderOverride): ProviderRuntimeSettings
           argv: override.command,
         }
       : undefined,
-    env: override.env,
+    env,
     disallowedTools: override.disallowedTools,
   };
 }

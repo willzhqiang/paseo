@@ -945,6 +945,7 @@ export class CursorSdkAgentClient implements AgentClient {
   constructor(options: CursorSdkAgentClientOptions) {
     this.logger = options.logger;
     // Prefer API key from config.json provider env, fall back to process.env
+    // Note: ${VAR} expansion is handled in provider-registry.ts toRuntimeSettings()
     this.apiKey =
       (options.runtimeSettings?.env?.["CURSOR_API_KEY"] as string | undefined) ??
       process.env.CURSOR_API_KEY;
