@@ -55,7 +55,9 @@ export function renderPromptAttachmentAsText(attachment: AgentAttachment): strin
       return lines.join("\n");
     }
     default:
-      throw new Error("unreachable");
+      // Defensive: unknown attachment types should not crash the provider.
+      // Return a placeholder instead of throwing.
+      return `[unsupported attachment: ${(attachment as { type: string }).type}]`;
   }
 }
 

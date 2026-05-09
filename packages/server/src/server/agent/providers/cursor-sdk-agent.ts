@@ -19,6 +19,8 @@
  */
 
 import { homedir } from "node:os";
+import { join as pathJoin } from "node:path";
+import { readFileSync, existsSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import type { Logger } from "pino";
 import { Agent, Cursor } from "@cursor/sdk";
@@ -94,6 +96,9 @@ function convertPromptToText(prompt: AgentPromptInput): string {
   return prompt
     .map((block) => {
       if (block.type === "text") return block.text;
+      // Image blocks cannot be rendered as plain text for the Cursor SDK —
+      // include a placeholder so the user knows an image was attached.
+      if (block.type === "image") return "[image attachment]";
       return renderPromptAttachmentAsText(
         block as Parameters<typeof renderPromptAttachmentAsText>[0],
       );
@@ -373,6 +378,246 @@ function parseModelId(modelId: string): ModelSelection {
 }
 
 // ---------------------------------------------------------------------------
+// JSONL transcript parsing (analogous to Claude Code's JSONL history loader)
+// ---------------------------------------------------------------------------
+
+/**
+ * Resolve the path to a Cursor SDK agent's JSONL transcript file.
+ *
+ * Layout: ~/.cursor/projects/<workspace-slug>/agent-transcripts/<agentId>/<agentId>.jsonl
+ * where workspace-slug is the cwd with leading / removed and / replaced by -.
+ */
+function resolveCursorTranscriptPath(cwd: string, agentId: string): string | null {
+  const slug = cwd.replace(/^\//, "").replace(/\//g, "-");
+  const cursorDir = pathJoin(homedir(), ".cursor", "projects", slug, "agent-transcripts", agentId);
+  const jsonlPath = pathJoin(cursorDir, `${agentId}.jsonl`);
+  return existsSync(jsonlPath) ? jsonlPath : null;
+}
+
+/**
+ * Parse a Cursor JSONL transcript into Paseo AgentTimelineItems.
+ *
+ * Format per line: { role: "user"|"assistant", message: { content: string | ContentBlock[] } }
+ * User messages have text wrapped in <user_query>...</user_query> tags.
+ */
+function parseCursorTranscript(content: string): AgentTimelineItem[] {
+  const items: AgentTimelineItem[] = [];
+  for (const line of content.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    let entry: { role?: string; message?: { content?: unknown } };
+    try {
+      entry = JSON.parse(trimmed) as typeof entry;
+    } catch {
+      continue;
+    }
+    if (!entry.role || !entry.message?.content) continue;
+
+    if (entry.role === "user") {
+      const text = extractCursorUserText(entry.message.content);
+      if (text) {
+        items.push({ type: "user_message", text });
+      }
+    } else if (entry.role === "assistant") {
+      const blocks = parseCursorAssistantContent(entry.message.content);
+      items.push(...blocks);
+    }
+  }
+  return items;
+}
+
+/** Extract user text from content, stripping <user_query> tags. */
+function extractCursorUserText(content: unknown): string | null {
+  let raw: string;
+  if (typeof content === "string") {
+    raw = content;
+  } else if (Array.isArray(content)) {
+    const textParts: string[] = [];
+    for (const block of content) {
+      if (block && typeof block === "object" && (block as { type?: string }).type === "text") {
+        const text = (block as { text?: string }).text;
+        if (text) textParts.push(text);
+      }
+    }
+    raw = textParts.join("\n");
+  } else {
+    return null;
+  }
+  // Strip <user_query>...</user_query> wrapper
+  const startTag = "<user_query>";
+  const endTag = "</user_query>";
+  const startIdx = raw.indexOf(startTag);
+  const endIdx = raw.indexOf(endTag);
+  if (startIdx >= 0 && endIdx > startIdx) {
+    raw = raw.slice(startIdx + startTag.length, endIdx);
+  }
+  const trimmed = raw.trim();
+  return trimmed || null;
+}
+
+/** Parse assistant content blocks into timeline items. */
+function parseCursorAssistantContent(content: unknown): AgentTimelineItem[] {
+  const items: AgentTimelineItem[] = [];
+  if (!Array.isArray(content)) return items;
+
+  // Track the last tool_call item so we can attach tool_result content to it.
+  let lastToolCallItem: (AgentTimelineItem & { type: "tool_call" }) | null = null;
+
+  for (const block of content) {
+    if (!block || typeof block !== "object") continue;
+    const b = block as Record<string, unknown>;
+    switch (b.type) {
+      case "text": {
+        const text = (b.text as string | undefined)?.trim();
+        if (text) {
+          items.push({ type: "assistant_message", text });
+        }
+        lastToolCallItem = null;
+        break;
+      }
+      case "thinking": {
+        const thinking = (b.thinking as string | undefined)?.trim();
+        if (thinking) {
+          items.push({ type: "reasoning", text: thinking });
+        }
+        lastToolCallItem = null;
+        break;
+      }
+      case "tool_use": {
+        const name = (b.name as string | undefined) ?? "unknown";
+        const input = b.input as Record<string, unknown> | undefined;
+        const toolItem = {
+          type: "tool_call" as const,
+          callId: (b.id as string | undefined) ?? randomUUID(),
+          name,
+          status: "completed" as const,
+          detail: mapCursorTranscriptToolCall(name, input),
+          error: null,
+        };
+        items.push(toolItem);
+        lastToolCallItem = toolItem;
+        break;
+      }
+      case "tool_result": {
+        // Attach tool_result content to the preceding tool_call's detail.
+        if (lastToolCallItem) {
+          const resultContent = extractToolResultText(b.content);
+          if (resultContent) {
+            enrichToolCallDetail(lastToolCallItem, resultContent);
+          }
+        }
+        lastToolCallItem = null;
+        break;
+      }
+      // Default: skip unknown block types
+    }
+  }
+  return items;
+}
+
+/** Extract text from a tool_result content field. */
+function extractToolResultText(content: unknown): string | null {
+  if (typeof content === "string") return content || null;
+  if (Array.isArray(content)) {
+    const parts: string[] = [];
+    for (const block of content) {
+      if (block && typeof block === "object") {
+        const b = block as Record<string, unknown>;
+        if (b.type === "text" && typeof b.text === "string") {
+          parts.push(b.text);
+        }
+      }
+    }
+    return parts.length > 0 ? parts.join("\n") : null;
+  }
+  return null;
+}
+
+/** Enrich a tool_call item's detail with the tool result output. */
+function enrichToolCallDetail(
+  item: AgentTimelineItem & { type: "tool_call" },
+  resultContent: string,
+): void {
+  const detail = item.detail;
+  if (!detail) return;
+  switch (detail.type) {
+    case "shell":
+      (detail as { output?: string }).output = resultContent;
+      break;
+    case "read":
+      (detail as { content?: string }).content = resultContent;
+      break;
+    case "search":
+      (detail as { content?: string }).content = resultContent;
+      break;
+    case "edit":
+      (detail as { unifiedDiff?: string }).unifiedDiff = resultContent;
+      break;
+    case "unknown":
+      (detail as { output?: unknown }).output = resultContent;
+      break;
+  }
+}
+
+/** Map a JSONL tool_use block to a Paseo ToolCallDetail. */
+function mapCursorTranscriptToolCall(
+  name: string,
+  input: Record<string, unknown> | undefined,
+): ToolCallDetail {
+  const lname = name.toLowerCase();
+  if (lname === "shell" || lname.includes("terminal") || lname === "run_terminal_cmd") {
+    return {
+      type: "shell",
+      command: (input?.["command"] as string | undefined) ?? name,
+    };
+  }
+  if (lname === "read" || lname === "read_file") {
+    const filePath = (input?.["path"] as string | undefined) ?? (input?.["target_file"] as string | undefined) ?? "";
+    // GUI shows "No additional details" for read without content.
+    // Provide the file path + range as content so the panel isn't empty.
+    const offset = input?.["offset"] as number | undefined;
+    const limit = input?.["limit"] as number | undefined;
+    const rangeInfo = [
+      offset !== undefined ? `offset: ${offset}` : null,
+      limit !== undefined ? `limit: ${limit}` : null,
+    ].filter(Boolean).join(", ");
+    return {
+      type: "read",
+      filePath,
+      offset,
+      limit,
+      content: rangeInfo ? `(${rangeInfo})` : "(full file)",
+    };
+  }
+  if (lname === "strreplace" || lname === "str_replace" || lname.includes("edit") || lname === "apply_diff") {
+    return {
+      type: "edit",
+      filePath: (input?.["path"] as string | undefined) ?? (input?.["target_file"] as string | undefined) ?? "",
+      oldString: input?.["old_string"] as string | undefined,
+      newString: input?.["new_string"] as string | undefined,
+    };
+  }
+  if (lname === "write" || lname === "write_file" || lname === "write_to_file" || lname === "create_file") {
+    return {
+      type: "write",
+      filePath: (input?.["path"] as string | undefined) ?? (input?.["target_file"] as string | undefined) ?? "",
+      content: input?.["content"] as string | undefined,
+    };
+  }
+  if (lname === "grep" || lname === "glob" || lname.includes("search") || lname === "websearch") {
+    const query = (input?.["pattern"] as string | undefined) ?? (input?.["query"] as string | undefined) ?? (input?.["search_term"] as string | undefined) ?? (input?.["glob_pattern"] as string | undefined) ?? name;
+    const path = (input?.["path"] as string | undefined) ?? (input?.["target_directory"] as string | undefined);
+    const summary = path ? `${query}  (in ${path})` : query;
+    return {
+      type: "search",
+      query,
+      content: summary,
+    };
+  }
+  return { type: "unknown", input: input ?? null, output: null };
+}
+
+// ---------------------------------------------------------------------------
 // CursorSdkAgentSession
 // ---------------------------------------------------------------------------
 
@@ -647,9 +892,15 @@ export class CursorSdkAgentSession implements AgentSession {
           };
         }
 
-        if (this.activeTurnId === turnId) {
-          this.activeTurnId = null;
+        // Guard: if the turn was already terminated by handleSdkMessage (e.g. a
+        // status ERROR/CANCELLED event arrived during streaming), do NOT emit a
+        // second terminal event — that would cause duplicate [System Error] messages.
+        if (this.activeTurnId !== turnId) {
+          this.currentRun = null;
+          return;
         }
+
+        this.activeTurnId = null;
         this.currentRun = null;
 
         if (result.status === "error") {
@@ -677,13 +928,17 @@ export class CursorSdkAgentSession implements AgentSession {
           });
         }
       } catch (error) {
-        const failedTurnId = this.activeTurnId ?? turnId;
+        // Guard: if the turn was already terminated, suppress the catch-path emit.
+        if (this.activeTurnId !== turnId) {
+          this.currentRun = null;
+          return;
+        }
         this.activeTurnId = null;
         this.currentRun = null;
         this.emit({
           type: "turn_failed",
           provider: CURSOR_PROVIDER,
-          turnId: failedTurnId,
+          turnId,
           error: toDiagnosticErrorMessage(error),
         });
       }
@@ -709,95 +964,125 @@ export class CursorSdkAgentSession implements AgentSession {
    * We map each variant to the appropriate Paseo ToolCallDetail.
    */
   async *streamHistory(): AsyncGenerator<AgentStreamEvent> {
+    // Strategy: prefer JSONL transcript (complete, includes user messages) over
+    // SDK conversation() API (incomplete — no userMessage in local runtime).
+    // This mirrors Claude Code provider's approach of reading local JSONL files.
+    const agentId = this.sdkAgent.agentId;
+    const transcriptPath = resolveCursorTranscriptPath(this.config.cwd, agentId);
+
+    if (transcriptPath) {
+      try {
+        const content = readFileSync(transcriptPath, "utf8");
+        const items = parseCursorTranscript(content);
+        for (const item of items) {
+          yield { type: "timeline", provider: CURSOR_PROVIDER, item };
+        }
+        return;
+      } catch (error) {
+        this.logger.debug(
+          { err: error, path: transcriptPath },
+          "Cursor JSONL transcript read failed, falling back to SDK",
+        );
+      }
+    }
+
+    // Fallback: use SDK conversation() API (missing user messages).
     try {
       const { items } = await Agent.listRuns(this.sdkAgent.agentId, {
         runtime: "local",
-        cwd: this.config.cwd,
-        limit: 1,
+        limit: 100,
       });
 
       if (items.length === 0) return;
 
-      const turns = await items[0].conversation();
+      // Emit the initial user prompt from config.title if available.
+      if (this.config.title) {
+        yield {
+          type: "timeline",
+          provider: CURSOR_PROVIDER,
+          item: { type: "user_message", text: this.config.title },
+        };
+      }
 
-      for (const turn of turns) {
-        if (turn.type === "agentConversationTurn") {
-          const { userMessage, steps } = turn.turn;
+      // Process runs in chronological order (oldest first).
+      const chronologicalRuns = [...items].reverse();
 
-          if (userMessage?.text) {
-            yield {
-              type: "timeline",
-              provider: CURSOR_PROVIDER,
-              item: { type: "user_message", text: userMessage.text },
-            };
-          }
+      for (const run of chronologicalRuns) {
+        const turns = await run.conversation();
 
-          for (const step of steps) {
-            if (step.type === "assistantMessage") {
+        for (const turn of turns) {
+          if (turn.type === "agentConversationTurn") {
+            const { userMessage, steps } = turn.turn;
+
+            if (userMessage?.text) {
               yield {
                 type: "timeline",
                 provider: CURSOR_PROVIDER,
-                item: { type: "assistant_message", text: step.message.text },
-              };
-            } else if (step.type === "thinkingMessage") {
-              yield {
-                type: "timeline",
-                provider: CURSOR_PROVIDER,
-                item: { type: "reasoning", text: step.message.text },
-              };
-            } else if (step.type === "toolCall") {
-              // step.message is a fully typed ToolCall discriminated union.
-              // Map each variant to the appropriate Paseo ToolCallDetail.
-              const tc = step.message;
-              const detail = mapCursorConversationToolCall(tc);
-              const isFailed = tc.result?.status === "error";
-              const baseItem = {
-                type: "tool_call" as const,
-                callId: randomUUID(),
-                name: tc.type,
-                detail,
-              };
-              const item = isFailed
-                ? {
-                    ...baseItem,
-                    status: "failed" as const,
-                    error: String(
-                      (tc.result as { error?: unknown } | undefined)?.error ?? "Tool call failed",
-                    ),
-                  }
-                : { ...baseItem, status: "completed" as const, error: null };
-              yield {
-                type: "timeline",
-                provider: CURSOR_PROVIDER,
-                item,
+                item: { type: "user_message", text: userMessage.text },
               };
             }
-          }
-        } else if (turn.type === "shellConversationTurn") {
-          const { shellCommand, shellOutput } = turn.turn;
-          if (shellCommand) {
-            yield {
-              type: "timeline",
-              provider: CURSOR_PROVIDER,
-              item: {
-                type: "tool_call",
-                callId: randomUUID(),
-                name: "shell",
-                status: shellOutput ? "completed" : "running",
-                detail: {
-                  type: "shell",
-                  command: shellCommand.command,
-                  output: shellOutput?.stdout,
-                  exitCode: shellOutput?.exitCode ?? null,
+
+            for (const step of steps) {
+              if (step.type === "assistantMessage") {
+                yield {
+                  type: "timeline",
+                  provider: CURSOR_PROVIDER,
+                  item: { type: "assistant_message", text: step.message.text },
+                };
+              } else if (step.type === "thinkingMessage") {
+                yield {
+                  type: "timeline",
+                  provider: CURSOR_PROVIDER,
+                  item: { type: "reasoning", text: step.message.text },
+                };
+              } else if (step.type === "toolCall") {
+                const tc = step.message;
+                const detail = mapCursorConversationToolCall(tc);
+                const isFailed = tc.result?.status === "error";
+                const baseItem = {
+                  type: "tool_call" as const,
+                  callId: randomUUID(),
+                  name: tc.type,
+                  detail,
+                };
+                const item = isFailed
+                  ? {
+                      ...baseItem,
+                      status: "failed" as const,
+                      error: String(
+                        (tc.result as { error?: unknown } | undefined)?.error ?? "Tool call failed",
+                      ),
+                    }
+                  : { ...baseItem, status: "completed" as const, error: null };
+                yield { type: "timeline", provider: CURSOR_PROVIDER, item };
+              }
+            }
+          } else if (turn.type === "shellConversationTurn") {
+            const { shellCommand, shellOutput } = turn.turn;
+            if (shellCommand) {
+              yield {
+                type: "timeline",
+                provider: CURSOR_PROVIDER,
+                item: {
+                  type: "tool_call",
+                  callId: randomUUID(),
+                  name: "shell",
+                  status: shellOutput ? "completed" : "running",
+                  detail: {
+                    type: "shell",
+                    command: shellCommand.command,
+                    output: shellOutput?.stdout,
+                    exitCode: shellOutput?.exitCode ?? null,
+                  },
+                  error: null,
                 },
-                error: null,
-              },
-            };
+              };
+            }
           }
         }
       }
     } catch (error) {
-      this.logger.debug({ err: error }, "Cursor streamHistory failed");
+      this.logger.debug({ err: error }, "Cursor streamHistory SDK fallback failed");
     }
   }
 
